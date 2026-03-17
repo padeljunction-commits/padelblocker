@@ -81,7 +81,7 @@ async function createPlaytomicBlocking(booking) {
     console.log('✅ Logged in.');
 
     // ── STEP 2: GO TO SCHEDULE ────────────────────────────────────────────
-    const scheduleUrl = `https://manager.playtomic.io/tenants/${CONFIG.PLAYTOMIC_TENANT_ID}/schedule`;
+    const scheduleUrl = `https://manager.playtomic.io/dashboard/schedule?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
     await page.goto(scheduleUrl, { waitUntil: 'networkidle' });
     console.log('📅 Schedule loaded.');
 
