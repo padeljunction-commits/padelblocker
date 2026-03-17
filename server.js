@@ -61,11 +61,12 @@ app.post('/webhook/catchcorner', async (req, res) => {
 
 // ── PLAYTOMIC AUTOMATION ──────────────────────────────────────────────────────
 async function createPlaytomicBlocking(booking) {
-  const browser = await chromium.launch({
-    executablePath: CONFIG.CHROMIUM_PATH,
+  const launchOptions = {
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  };
+  if (CONFIG.CHROMIUM_PATH) launchOptions.executablePath = CONFIG.CHROMIUM_PATH;
+  const browser = await chromium.launch(launchOptions);
 
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page    = await context.newPage();
