@@ -114,7 +114,7 @@ async function createPlaytomicBlocking(booking) {
     await page.waitForTimeout(800);
 
     // Find the 6:00 AM row by looking for the time label, then click that row's court cell
-    const timeLabel = page.locator('td, th').filter({ hasText: /^6:00/ }).first();
+    const timeLabel = page.locator('td, th').filter({ hasText: /^06:00/ }).first();
     await timeLabel.waitFor({ timeout: 10000 });
     const timeRow = timeLabel.locator('xpath=ancestor::tr');
     const emptyCell = timeRow.locator(`td:nth-child(${colIndex})`);
