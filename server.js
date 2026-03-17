@@ -90,34 +90,73 @@ async function createPlaytomicBlocking(booking) {
     const targetDate = new Date(booking.startTime);
     await navigateToDate(page, targetDate);
 
-    // ── STEP 4: CLICK AN EMPTY SLOT TO OPEN THE CREATE PANEL ─────────────
-    // Click in the correct court column at any visible empty time slot.
-    // The panel opens regardless of which slot we click — we'll override all
-    // values in the form anyway.
-    const courtNum  = booking.court.match(/\d+/)?.[0] || "1";
-    const courtCol  = courtNum === "1" ? "Padel 1" : "Padel 2";
-    const colHeader = page.locator(`text="${courtCol}"`).first();
-    await colHeader.waitFor({ timeout: 10000 });
+    // ── STEP 4: FIND THE CORRECT COURT COLUMN AND CLICK AN EMPTY CELL ──────
+    const courtNum = booking.court.match(/\d+/)?.[0] || "1";
+    const courtCol = courtNum === "1" ? "Padel 1" : "Padel 2";
 
-    // Click in the schedule grid under the correct court header
-    const headerBox = await colHeader.boundingBox();
-    await page.mouse.click(headerBox.x + headerBox.width / 2, headerBox.y + 200);
-    console.log(`🖱️  Clicked on ${courtCol} column to open booking panel.`);
+    // Wait for the schedule grid to be present
+    await page.waitForSelector('text="Padel 1"', { timeout: 15000 });
+    await page.waitForTimeout(2000); // let the grid fully render
+
+    // Find all column headers and determine the X centre of the right court column
+    const headers = await page.locator('th, [class*="header"], [class*="column-header"]').all();
+    let courtX = null;
+    for (const h of headers) {
+      const txt = await h.textContent().catch(() => '');
+      if (txt.trim() === courtCol) {
+        const box = await h.boundingBox();
+        if (box) { courtX = box.x + box.width / 2; break; }
+      }
+    }
+
+    // Fallback: use page text locator
+    if (!courtX) {
+      const headerLoc = page.locator(`text="${courtCol}"`).first();
+      const box = await headerLoc.boundingBox();
+      if (box) courtX = box.x + box.width / 2;
+    }
+
+    if (!courtX) throw new Error(`Could not find column for ${courtCol}`);
+
+    // Click at the court X position, in the middle-ish vertical area of the schedule
+    // Try multiple Y positions until the panel opens
+    const viewportHeight = page.viewportSize().height;
+    const yPositions = [300, 400, 250, 350, 450];
+    let panelOpened = false;
+
+    for (const y of yPositions) {
+      await page.mouse.click(courtX, y);
+      console.log(\`🖱️  Clicked ${courtCol} at y=${y}\`);
+      await page.waitForTimeout(1000);
+
+      // Check if any booking panel opened
+      const panelVisible = await page.locator('button:has-text("Regular booking"), text="Create regular booking", text="Create blocking"').first().isVisible().catch(() => false);
+      if (panelVisible) {
+        panelOpened = true;
+        console.log('✅ Booking panel opened.');
+        break;
+      }
+    }
+
+    if (!panelOpened) throw new Error('Could not open booking panel after multiple click attempts.');
 
     // ── STEP 5: SWITCH TO BLOCKING ────────────────────────────────────────
-    // The panel opens as "Create regular booking" — click the type dropdown
-    const typeDropdown = page.locator('button:has-text("Regular booking")').first();
-    await typeDropdown.waitFor({ timeout: 8000 });
-    await typeDropdown.click();
+    // If "Create blocking" is already shown, skip the dropdown
+    const alreadyBlocking = await page.locator('text="Create blocking"').first().isVisible().catch(() => false);
 
-    // Select "Blocking" from the dropdown list
-    const blockingOption = page.locator('text="Blocking"').first();
-    await blockingOption.waitFor({ timeout: 5000 });
-    await blockingOption.click();
-    console.log('🔒 Switched to Blocking type.');
+    if (!alreadyBlocking) {
+      const typeDropdown = page.locator('button:has-text("Regular booking")').first();
+      await typeDropdown.waitFor({ timeout: 8000 });
+      await typeDropdown.click();
+      await page.waitForTimeout(500);
 
-    // ── STEP 6: WAIT FOR "CREATE BLOCKING" FORM ───────────────────────────
-    await page.waitForSelector('text="Create blocking"', { timeout: 8000 });
+      // Select "Blocking"
+      await page.locator('text="Blocking"').last().click();
+      console.log('🔒 Switched to Blocking type.');
+      await page.waitForSelector('text="Create blocking"', { timeout: 8000 });
+    } else {
+      console.log('🔒 Blocking panel already open.');
+    }
 
     // ── STEP 7: FILL TITLE ────────────────────────────────────────────────
     const titleInput = page.locator('input[placeholder="E.g.: Maintenance"]').first();
