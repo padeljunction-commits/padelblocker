@@ -94,6 +94,25 @@ async function createPlaytomicBlocking(booking) {
     const courtNum = booking.court.match(/\d+/)?.[0] || '1';
     const colIndex = courtNum === '1' ? 2 : 3;
 
+    // Scroll the schedule grid to the top to reveal 6:00 AM row
+    // Try all known FullCalendar scroller selectors
+    await page.evaluate(() => {
+      const selectors = [
+        '.fc-scroller',
+        '.fc-time-grid-container',
+        '.fc-scroller-liquid-absolute',
+        '[class*="fc-scroller"]',
+        '[class*="scroller"]',
+      ];
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el && el.scrollHeight > el.clientHeight) {
+          el.scrollTop = 0;
+        }
+      }
+    });
+    await page.waitForTimeout(800);
+
     // Find the 6:00 AM row by looking for the time label, then click that row's court cell
     const timeLabel = page.locator('td, th').filter({ hasText: /^6:00/ }).first();
     await timeLabel.waitFor({ timeout: 10000 });
