@@ -87,18 +87,21 @@ async function createPlaytomicBlocking(booking) {
     // Navigate to the correct date using the calendar
     await navigateToDate(page, start);
 
-    // ── STEP 3: CLICK AN EMPTY CELL IN THE CORRECT COURT COLUMN ──────────
-    // td:nth-child(2) = Padel 1, td:nth-child(3) = Padel 2
-    const courtNum  = booking.court.match(/\d+/)?.[0] || '1';
-    const colIndex  = courtNum === '1' ? 2 : 3;
+    // ── STEP 3: CLICK THE 6:00 AM CELL IN THE CORRECT COURT COLUMN ─────────
+    // We always click the 6:00 AM row — courts never open this early so it
+    // is guaranteed to be empty and will always open a new booking panel,
+    // never an existing booking. We override all values in the form anyway.
+    const courtNum = booking.court.match(/\d+/)?.[0] || '1';
+    const colIndex = courtNum === '1' ? 2 : 3;
 
-    // Click a cell in the middle of the schedule (row 20 is safely in the grid)
-    // The exact row doesn't matter — we override date/time in the form
-    const cell = page.locator(`tr:nth-child(20) > td:nth-child(${colIndex})`);
-    await cell.waitFor({ timeout: 10000 });
-    await cell.click();
+    // Find the 6:00 AM row by looking for the time label, then click that row's court cell
+    const timeLabel = page.locator('td, th').filter({ hasText: /^6:00/ }).first();
+    await timeLabel.waitFor({ timeout: 10000 });
+    const timeRow = timeLabel.locator('xpath=ancestor::tr');
+    const emptyCell = timeRow.locator(`td:nth-child(${colIndex})`);
+    await emptyCell.click({ force: true });
     await page.waitForTimeout(1000);
-    console.log(`🖱️  Clicked court column ${colIndex} (Padel ${courtNum})`);
+    console.log(`🖱️  Clicked 6:00 AM cell in Padel ${courtNum} column`);
 
     // ── STEP 4: SWITCH TO BLOCKING ────────────────────────────────────────
     await page.getByRole('button', { name: 'Regular booking' }).click();
