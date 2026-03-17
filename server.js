@@ -74,16 +74,16 @@ async function createPlaytomicBlocking(booking) {
   try {
     // ── STEP 1: LOG IN ────────────────────────────────────────────────────
     console.log('🔐 Logging in...');
-    await page.goto('https://manager.playtomic.io/login', { waitUntil: 'networkidle' });
+    await page.goto('https://manager.playtomic.io/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.fill('input[type="email"]', CONFIG.PLAYTOMIC_EMAIL);
     await page.fill('input[type="password"]', CONFIG.PLAYTOMIC_PASSWORD);
     await page.click('button[type="submit"]');
-    await page.waitForNavigation({ waitUntil: 'networkidle' });
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
     console.log('✅ Logged in.');
 
     // ── STEP 2: GO TO SCHEDULE ────────────────────────────────────────────
     const scheduleUrl = `https://manager.playtomic.io/dashboard/schedule?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
-    await page.goto(scheduleUrl, { waitUntil: 'networkidle' });
+    await page.goto(scheduleUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     console.log('📅 Schedule loaded.');
 
     // ── STEP 3: NAVIGATE TO THE CORRECT DATE ─────────────────────────────
