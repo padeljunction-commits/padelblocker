@@ -1,15 +1,6 @@
 /**
  * PADEL JUNCTION — PLAYTOMIC AUTO-BLOCKER
- * ----------------------------------------
- * Receives a webhook from Google Apps Script when a non-Playtomic calendar
- * event is detected, then uses Playwright to log into Playtomic Manager and
- * create a Blocking — verified against real Playtomic Manager UI (March 2026).
- *
- * Flow observed in UI:
- *   1. Schedule page → click empty slot → "Create regular booking" panel opens
- *   2. Click "Regular booking" dropdown → select "Blocking"
- *   3. Fill: Title, Court (Padel 1 / Padel 2), Date, Start time, End time
- *   4. Click "Create"
+ * Selectors verified via Playwright Codegen on real Playtomic Manager UI (March 2026)
  */
 
 require('dotenv').config();
@@ -47,8 +38,6 @@ app.post('/webhook/catchcorner', async (req, res) => {
   }
 
   console.log(`📥 Booking received: ${booking.court} @ ${booking.startTime} – ${booking.endTime}`);
-
-  // Respond immediately so Apps Script doesn't time out
   res.json({ status: 'accepted' });
 
   try {
@@ -68,220 +57,112 @@ async function createPlaytomicBlocking(booking) {
   if (CONFIG.CHROMIUM_PATH) launchOptions.executablePath = CONFIG.CHROMIUM_PATH;
   const browser = await chromium.launch(launchOptions);
 
-  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page    = await context.newPage();
 
   try {
     // ── STEP 1: LOG IN ────────────────────────────────────────────────────
     console.log('🔐 Logging in...');
-    await page.goto('https://manager.playtomic.io/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.fill('input[type="email"]', CONFIG.PLAYTOMIC_EMAIL);
-    await page.fill('input[type="password"]', CONFIG.PLAYTOMIC_PASSWORD);
-    await page.click('button[type="submit"]');
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await page.goto('https://manager.playtomic.io/auth/login', {
+      waitUntil: 'domcontentloaded', timeout: 60000,
+    });
+
+    await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
+    await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
+    await page.getByRole('button', { name: 'Log In' }).click();
+
+    // Wait for schedule to appear after login
+    await page.waitForURL('**/schedule**', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2000);
     console.log('✅ Logged in.');
 
-    // ── STEP 2: GO TO SCHEDULE ────────────────────────────────────────────
+    // ── STEP 2: NAVIGATE TO SCHEDULE FOR THE RIGHT DATE ───────────────────
+    const start  = new Date(booking.startTime);
+    const end    = new Date(booking.endTime);
     const scheduleUrl = `https://manager.playtomic.io/dashboard/schedule?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
     await page.goto(scheduleUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(2000);
     console.log('📅 Schedule loaded.');
 
-    // ── STEP 3: NAVIGATE TO THE CORRECT DATE ─────────────────────────────
-    const targetDate = new Date(booking.startTime);
-    await navigateToDate(page, targetDate);
+    // Navigate to the correct date using the calendar
+    await navigateToDate(page, start);
 
-    // ── STEP 4: FIND THE CORRECT COURT COLUMN AND CLICK AN EMPTY CELL ──────
-    const courtNum = booking.court.match(/\d+/)?.[0] || "1";
-    const courtCol = courtNum === "1" ? "Padel 1" : "Padel 2";
+    // ── STEP 3: CLICK AN EMPTY CELL IN THE CORRECT COURT COLUMN ──────────
+    // td:nth-child(2) = Padel 1, td:nth-child(3) = Padel 2
+    const courtNum  = booking.court.match(/\d+/)?.[0] || '1';
+    const colIndex  = courtNum === '1' ? 2 : 3;
 
-    // Wait for the schedule grid to be present
-    await page.waitForSelector('text="Padel 1"', { timeout: 15000 });
-    await page.waitForTimeout(2000); // let the grid fully render
+    // Click a cell in the middle of the schedule (row 20 is safely in the grid)
+    // The exact row doesn't matter — we override date/time in the form
+    const cell = page.locator(`tr:nth-child(20) > td:nth-child(${colIndex})`);
+    await cell.waitFor({ timeout: 10000 });
+    await cell.click();
+    await page.waitForTimeout(1000);
+    console.log(`🖱️  Clicked court column ${colIndex} (Padel ${courtNum})`);
 
-    // Find all column headers and determine the X centre of the right court column
-    const headers = await page.locator('th, [class*="header"], [class*="column-header"]').all();
-    let courtX = null;
-    for (const h of headers) {
-      const txt = await h.textContent().catch(() => '');
-      if (txt.trim() === courtCol) {
-        const box = await h.boundingBox();
-        if (box) { courtX = box.x + box.width / 2; break; }
-      }
-    }
+    // ── STEP 4: SWITCH TO BLOCKING ────────────────────────────────────────
+    await page.getByRole('button', { name: 'Regular booking' }).click();
+    await page.waitForTimeout(500);
+    await page.getByRole('button', { name: /Blocking/i }).click();
+    await page.waitForTimeout(1000);
+    console.log('🔒 Switched to Blocking.');
 
-    // Fallback: use page text locator
-    if (!courtX) {
-      const headerLoc = page.locator(`text="${courtCol}"`).first();
-      const box = await headerLoc.boundingBox();
-      if (box) courtX = box.x + box.width / 2;
-    }
+    // ── STEP 5: FILL TITLE ────────────────────────────────────────────────
+    const courtName = `Padel ${courtNum}`;
+    await page.getByRole('textbox', { name: 'Title' }).fill(`CatchCorner – ${booking.customer}`);
+    await page.getByRole('textbox', { name: 'Title' }).press('Tab');
+    console.log('📝 Title filled.');
 
-    if (!courtX) throw new Error(`Could not find column for ${courtCol}`);
+    // ── STEP 6: SET COURT ─────────────────────────────────────────────────
+    // Click the current court dropdown value, then select the right court
+    const courtDropdown = page.locator('div').filter({ hasText: new RegExp(`^Padel \\d$`) }).first();
+    await courtDropdown.click();
+    await page.waitForTimeout(500);
+    // Select by text in the react-select dropdown
+    await page.getByText(courtName, { exact: true }).last().click();
+    await page.waitForTimeout(500);
+    console.log(`🏓 Court set to: ${courtName}`);
 
-    // Click at the court X position, in the middle-ish vertical area of the schedule
-    // Try multiple Y positions until the panel opens
-    const viewportHeight = page.viewportSize().height;
-    const yPositions = [300, 400, 250, 350, 450];
-    let panelOpened = false;
+    // ── STEP 7: SET DATE ──────────────────────────────────────────────────
+    await page.getByRole('button', { name: 'Date' }).click();
+    await page.waitForTimeout(500);
 
-    for (const y of yPositions) {
-      await page.mouse.click(courtX, y);
-      console.log(\`🖱️  Clicked ${courtCol} at y=${y}\`);
-      await page.waitForTimeout(1000);
+    // If the calendar isn't on the right month, navigate to it
+    await navigateCalendarToMonth(page, start);
 
-      // Check if any booking panel opened
-      const panelVisible = await page.locator('button:has-text("Regular booking"), text="Create regular booking", text="Create blocking"').first().isVisible().catch(() => false);
-      if (panelVisible) {
-        panelOpened = true;
-        console.log('✅ Booking panel opened.');
-        break;
-      }
-    }
+    // Click the correct day
+    const day = start.getDate().toString();
+    await page.getByRole('gridcell', { name: day }).click();
+    await page.waitForTimeout(500);
+    console.log(`📆 Date set: ${start.toISOString().split('T')[0]}`);
 
-    if (!panelOpened) throw new Error('Could not open booking panel after multiple click attempts.');
+    // ── STEP 8: SET START TIME ────────────────────────────────────────────
+    // Times appear as a scrollable list — click the matching time text
+    const startTimeStr = toPickerFormat(start);
+    const endTimeStr   = toPickerFormat(end);
 
-    // ── STEP 5: SWITCH TO BLOCKING ────────────────────────────────────────
-    // If "Create blocking" is already shown, skip the dropdown
-    const alreadyBlocking = await page.locator('text="Create blocking"').first().isVisible().catch(() => false);
+    // The start time picker — click current start time display to open list
+    const startTimeTrigger = page.locator('div').filter({ hasText: new RegExp(`^\\d{1,2}:\\d{2} (AM|PM)$`) }).nth(2);
+    await startTimeTrigger.click();
+    await page.waitForTimeout(500);
+    await page.getByText(startTimeStr, { exact: true }).click();
+    await page.waitForTimeout(500);
+    console.log(`⏰ Start time set: ${startTimeStr}`);
 
-    if (!alreadyBlocking) {
-      const typeDropdown = page.locator('button:has-text("Regular booking")').first();
-      await typeDropdown.waitFor({ timeout: 8000 });
-      await typeDropdown.click();
-      await page.waitForTimeout(500);
+    // ── STEP 9: SET END TIME ──────────────────────────────────────────────
+    await page.getByText(endTimeStr, { exact: true }).click();
+    await page.waitForTimeout(500);
+    console.log(`⏰ End time set: ${endTimeStr}`);
 
-      // Select "Blocking"
-      await page.locator('text="Blocking"').last().click();
-      console.log('🔒 Switched to Blocking type.');
-      await page.waitForSelector('text="Create blocking"', { timeout: 8000 });
-    } else {
-      console.log('🔒 Blocking panel already open.');
-    }
-
-    // ── STEP 7: FILL TITLE ────────────────────────────────────────────────
-    const titleInput = page.locator('input[placeholder="E.g.: Maintenance"]').first();
-    await titleInput.waitFor({ timeout: 5000 });
-    await titleInput.fill(`CatchCorner – ${booking.customer}`);
-
-    // ── STEP 8: SELECT COURT ──────────────────────────────────────────────
-    // Court dropdown currently shows the court we clicked — verify and adjust if needed
-    const courtDropdown = page.locator('text="Court"').locator('..').locator('select, [role="combobox"]').first();
-    try {
-      await courtDropdown.selectOption({ label: courtCol });
-    } catch {
-      // Some Playtomic dropdowns are custom — try clicking and selecting
-      const courtBtn = page.locator(`button:has-text("${courtCol}"), div[role="button"]:has-text("${courtCol}")`).first();
-      if (await courtBtn.count() > 0) {
-        await courtBtn.click();
-        await page.locator(`text="${courtCol}"`).last().click();
-      }
-    }
-    console.log(`🏓 Court set to: ${courtCol}`);
-
-    // ── STEP 9: SET DATE ──────────────────────────────────────────────────
-    // Format: 2026-03-17 (YYYY-MM-DD) — confirmed in UI
-    const dateStr = targetDate.toISOString().split('T')[0];
-    const dateInput = page.locator('input[type="date"], input[placeholder*="date" i]').first();
-    await dateInput.waitFor({ timeout: 5000 });
-    await dateInput.fill(dateStr);
-    await dateInput.press('Tab');
-    console.log(`📆 Date set: ${dateStr}`);
-
-    // ── STEP 10: SET START TIME ───────────────────────────────────────────
-    // Format: "01:30 p.m." — confirmed in UI
-    const startStr = toPlaytomicTimeFormat(new Date(booking.startTime));
-    const endStr   = toPlaytomicTimeFormat(new Date(booking.endTime));
-
-    const timeInputs = page.locator('input[placeholder*="time" i], input[aria-label*="time" i], input[aria-label*="start" i]');
-    const startInput = page.locator('input').filter({ has: page.locator(':scope[aria-label*="start" i]') }).first();
-
-    // Target by proximity to "Start time" label
-    const startTimeInput = page.locator('label:has-text("Start time") + * input, label:has-text("Start time") ~ * input').first();
-    const endTimeInput   = page.locator('label:has-text("End time") + * input, label:has-text("End time") ~ * input').first();
-
-    if (await startTimeInput.count() > 0) {
-      await startTimeInput.triple_click ? startTimeInput.click({ clickCount: 3 }) : startTimeInput.click();
-      await startTimeInput.fill(startStr);
-      await startTimeInput.press('Tab');
-    } else {
-      // Fallback: find all time-looking inputs and use position
-      const allInputs = await page.locator('input').all();
-      for (const input of allInputs) {
-        const val = await input.inputValue().catch(() => '');
-        if (val.match(/\d{1,2}:\d{2}\s*[ap]\.m\./i)) {
-          const label = await input.evaluate(el => {
-            const form = el.closest('form') || el.closest('[role="dialog"]') || document;
-            const labels = form.querySelectorAll('label');
-            for (const l of labels) {
-              if (l.htmlFor === el.id || l.contains(el)) return l.textContent;
-            }
-            return '';
-          });
-          if (label.toLowerCase().includes('start')) {
-            await input.click({ clickCount: 3 });
-            await input.fill(startStr);
-            await input.press('Tab');
-            break;
-          }
-        }
-      }
-    }
-    console.log(`⏰ Start time set: ${startStr}`);
-
-    if (await endTimeInput.count() > 0) {
-      await endTimeInput.click({ clickCount: 3 });
-      await endTimeInput.fill(endStr);
-      await endTimeInput.press('Tab');
-    } else {
-      const allInputs = await page.locator('input').all();
-      for (const input of allInputs) {
-        const val = await input.inputValue().catch(() => '');
-        if (val.match(/\d{1,2}:\d{2}\s*[ap]\.m\./i)) {
-          const label = await input.evaluate(el => {
-            const form = el.closest('form') || el.closest('[role="dialog"]') || document;
-            const labels = form.querySelectorAll('label');
-            for (const l of labels) {
-              if (l.htmlFor === el.id || l.contains(el)) return l.textContent;
-            }
-            return '';
-          });
-          if (label.toLowerCase().includes('end')) {
-            await input.click({ clickCount: 3 });
-            await input.fill(endStr);
-            await input.press('Tab');
-            break;
-          }
-        }
-      }
-    }
-    console.log(`⏰ End time set: ${endStr}`);
-
-    // ── STEP 11: ADD NOTES ────────────────────────────────────────────────
-    const notesInput = page.locator('textarea[placeholder*="Private notes" i]').first();
-    if (await notesInput.count() > 0) {
-      await notesInput.fill(`Auto-blocked from CatchCorner. Booking ID: ${booking.id}. Customer: ${booking.customer}`);
-    }
-
-    // ── STEP 12: TAKE PRE-SUBMIT SCREENSHOT ───────────────────────────────
+    // ── STEP 10: SCREENSHOT BEFORE SUBMIT ─────────────────────────────────
     await takeScreenshot(page, booking.id, 'before-submit');
 
-    // ── STEP 13: SUBMIT ───────────────────────────────────────────────────
-    const createBtn = page.locator('button:has-text("Create")').last();
-    await createBtn.waitFor({ timeout: 5000 });
-    await createBtn.click();
-    console.log('🖱️  Clicked Create.');
-
-    // ── STEP 14: VERIFY ───────────────────────────────────────────────────
+    // ── STEP 11: SUBMIT ───────────────────────────────────────────────────
+    await page.getByRole('button', { name: 'Create' }).click();
     await page.waitForTimeout(2000);
+    console.log('✅ Create clicked.');
+
     await takeScreenshot(page, booking.id, 'after-submit');
-
-    // Check for error messages
-    const errorMsg = await page.locator('text=/error|failed|invalid/i').count();
-    if (errorMsg > 0) {
-      throw new Error('Page shows an error after submission — check screenshot.');
-    }
-
-    console.log(`✅ Blocking created: ${courtCol} on ${dateStr} ${startStr} – ${endStr}`);
 
   } catch (err) {
     await takeScreenshot(page, booking.id, 'error');
@@ -291,41 +172,48 @@ async function createPlaytomicBlocking(booking) {
   }
 }
 
-// ── NAVIGATE TO DATE ──────────────────────────────────────────────────────────
-// Uses the date picker in the schedule header to jump to the right date.
+// ── NAVIGATE SCHEDULE TO DATE ─────────────────────────────────────────────────
 async function navigateToDate(page, targetDate) {
-  // Format: "Tue, Mar 17" — matches the date pill shown in the schedule header
-  const targetStr = targetDate.toISOString().split('T')[0]; // YYYY-MM-DD for input
+  // Click the date pill in the schedule header to open the date picker
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthStr = months[targetDate.getMonth()];
+  const dayStr   = targetDate.getDate();
 
-  // Click the calendar icon / date pill in the header
-  const datePicker = page.locator('[aria-label*="date" i], button:has-text("Mar"), button:has-text("Jan"), button:has-text("Feb"), button:has-text("Apr"), button:has-text("May"), button:has-text("Jun"), button:has-text("Jul"), button:has-text("Aug"), button:has-text("Sep"), button:has-text("Oct"), button:has-text("Nov"), button:has-text("Dec")').first();
-
-  try {
-    await datePicker.waitFor({ timeout: 5000 });
-    await datePicker.click();
-    // If a date input appears, fill it
-    const dateField = page.locator('input[type="date"]').first();
-    if (await dateField.count() > 0) {
-      await dateField.fill(targetStr);
-      await dateField.press('Enter');
-    }
-  } catch {
-    // If date picker doesn't respond, try clicking the calendar icon
-    const calIcon = page.locator('svg[data-icon*="calendar"], button[aria-label*="calendar" i]').first();
-    if (await calIcon.count() > 0) await calIcon.click();
+  // Click the date navigation button (shows current date like "Tue, Mar 17")
+  const datePill = page.locator(`button:has-text("${monthStr}")`).first();
+  if (await datePill.count() > 0) {
+    await datePill.click();
+    await page.waitForTimeout(500);
+    await navigateCalendarToMonth(page, targetDate);
+    await page.getByRole('gridcell', { name: dayStr.toString() }).click();
+    await page.waitForTimeout(1000);
   }
+  console.log(`📆 Navigated to: ${targetDate.toISOString().split('T')[0]}`);
+}
 
-  await page.waitForTimeout(1000);
-  console.log(`📆 Navigated to date: ${targetStr}`);
+// ── NAVIGATE CALENDAR POPUP TO CORRECT MONTH ─────────────────────────────────
+async function navigateCalendarToMonth(page, targetDate) {
+  const months = ['January','February','March','April','May','June',
+                  'July','August','September','October','November','December'];
+  const targetMonth = months[targetDate.getMonth()];
+  const targetYear  = targetDate.getFullYear();
+
+  for (let i = 0; i < 12; i++) {
+    const header = await page.locator('[class*="calendar"] [class*="month"], [class*="DayPicker"] .DayPicker-Caption').first().textContent().catch(() => '');
+    if (header.includes(targetMonth) && header.includes(targetYear.toString())) break;
+    // Click next month button
+    await page.locator('button[aria-label*="next"], button[aria-label*="Next"], [class*="next"]').last().click();
+    await page.waitForTimeout(300);
+  }
 }
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
-// Converts a JS Date to Playtomic's time format: "01:30 p.m."
-function toPlaytomicTimeFormat(date) {
-  let h = date.getHours();
-  const m   = date.getMinutes();
-  const mer = h >= 12 ? 'p.m.' : 'a.m.';
+// Converts JS Date to Playtomic time picker format: "01:30 PM"
+function toPickerFormat(date) {
+  let h = date.getUTCHours();
+  const m   = date.getUTCMinutes();
+  const mer = h >= 12 ? 'PM' : 'AM';
   if (h > 12) h -= 12;
   if (h === 0) h = 12;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} ${mer}`;
@@ -333,9 +221,10 @@ function toPlaytomicTimeFormat(date) {
 
 async function takeScreenshot(page, bookingId, label) {
   try {
-    const path = `/tmp/screenshot-${bookingId}-${label}.png`;
-    await page.screenshot({ path, fullPage: false });
-    console.log(`📸 Screenshot: ${path}`);
+    const buffer = await page.screenshot({ fullPage: false });
+    const b64 = buffer.toString('base64');
+    console.log(`📸 Screenshot [${bookingId}-${label}] — paste into browser address bar:`);
+    console.log(`data:image/png;base64,${b64}`);
   } catch (_) {}
 }
 
