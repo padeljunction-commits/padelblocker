@@ -171,7 +171,8 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(500);
     await page.evaluate((name) => {
       const opts = Array.from(document.querySelectorAll('.select__option')).filter(o => o.offsetParent);
-      const t = opts.find(o => o.textContent.trim() === name);
+      const norm = s => s.trim().toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
+      const t = opts.find(o => norm(o.textContent) === norm(name));
       if (!t) throw new Error(`Court "${name}" not found. Options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
       t.click();
     }, courtName);
@@ -196,7 +197,8 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(400);
     await page.evaluate((disp) => {
       const opts = Array.from(document.querySelectorAll('.select__option')).filter(o => o.offsetParent);
-      const t = opts.find(o => o.textContent.trim() === disp);
+      const norm = s => s.trim().toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
+      const t = opts.find(o => norm(o.textContent) === norm(disp));
       if (!t) throw new Error(`Start "${disp}" not found. Options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
       t.click();
     }, startDisp);
@@ -221,7 +223,8 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(400);
     await page.evaluate((disp) => {
       const opts = Array.from(document.querySelectorAll('.select__option')).filter(o => o.offsetParent);
-      const t = opts.find(o => o.textContent.trim() === disp);
+      const norm = s => s.trim().toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
+      const t = opts.find(o => norm(o.textContent) === norm(disp));
       if (!t) throw new Error(`End "${disp}" not found. Options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
       t.click();
     }, endDisp);
