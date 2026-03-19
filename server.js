@@ -26,13 +26,6 @@ const CONFIG = {
   CHROMIUM_PATH:       process.env.CHROMIUM_PATH || null,
 };
 
-// Court dropdown X coordinates (verified from live DOM inspection)
-// Used for mouse clicks since React-Select requires real pointer events
-const COURT_DROPDOWN_X = 748;
-const START_TIME_X     = 573;
-const END_TIME_X       = 805;
-const DROPDOWNS_Y      = 302;
-
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'Padel Junction Playtomic Blocker' });
@@ -108,18 +101,28 @@ async function createPlaytomicBlocking(booking) {
     const courtNum  = booking.court.match(/\d+/)?.[0] || '1';
     const courtName = `Padel ${courtNum}`;
 
-    await page.mouse.click(COURT_DROPDOWN_X, DROPDOWNS_Y); // focus
-    await page.waitForTimeout(200);
-    await page.mouse.click(COURT_DROPDOWN_X, DROPDOWNS_Y); // open
+    // Open the court React-Select by clicking its control element twice
+    // (first click focuses, second opens — verified behaviour on React-Select)
+    const courtControl = page.locator('#input-resource').locator('xpath=ancestor::div[contains(@class,"select__control")]').first();
+    await courtControl.waitFor({ timeout: 10000 });
+    await courtControl.click();
+    await page.waitForTimeout(300);
+    await courtControl.click();
     await page.waitForTimeout(400);
 
-    // Click the option by text using JS (reliable after dropdown is open)
-    await page.evaluate((name) => {
-      const opt = Array.from(document.querySelectorAll('.select__option'))
-        .find(o => o.textContent.trim() === name);
-      if (!opt) throw new Error(`Court option "${name}" not found`);
-      opt.click();
-    }, courtName);
+    // Wait for options to appear then click the right one
+    await page.waitForSelector('.select__option', { timeout: 5000 });
+    const courtOptions = await page.locator('.select__option').all();
+    let courtClicked = false;
+    for (const opt of courtOptions) {
+      const text = await opt.textContent();
+      if (text?.trim() === courtName) {
+        await opt.click();
+        courtClicked = true;
+        break;
+      }
+    }
+    if (!courtClicked) throw new Error(`Court option "${courtName}" not found in dropdown`);
     await page.waitForTimeout(400);
     console.log(`🏓 Court set: ${courtName}`);
 
@@ -149,36 +152,44 @@ async function createPlaytomicBlocking(booking) {
     const startType = toTypeStr(start);      // "4:00"
     const endType   = toTypeStr(end);        // "5:30"
 
-    await page.mouse.click(START_TIME_X, DROPDOWNS_Y); // focus
-    await page.waitForTimeout(200);
-    await page.mouse.click(START_TIME_X, DROPDOWNS_Y); // open
+    // Open start time dropdown the same way — click the control twice
+    const startControl = page.locator('#input-startTime').locator('xpath=ancestor::div[contains(@class,"select__control")]').first();
+    await startControl.waitFor({ timeout: 5000 });
+    await startControl.click();
+    await page.waitForTimeout(300);
+    await startControl.click();
     await page.waitForTimeout(300);
     await page.keyboard.type(startType);
     await page.waitForTimeout(300);
-    await page.evaluate((disp) => {
-      const opt = Array.from(document.querySelectorAll('.select__option'))
-        .filter(o => o.offsetParent)
-        .find(o => o.textContent.trim() === disp);
-      if (!opt) throw new Error(`Start time option "${disp}" not found`);
-      opt.click();
-    }, startDisp);
+    await page.waitForSelector('.select__option', { timeout: 5000 });
+    const startOptions = await page.locator('.select__option').all();
+    let startClicked = false;
+    for (const opt of startOptions) {
+      const text = await opt.textContent();
+      if (text?.trim() === startDisp) { await opt.click(); startClicked = true; break; }
+    }
+    if (!startClicked) throw new Error(`Start time option "${startDisp}" not found`);
     await page.waitForTimeout(300);
     console.log(`⏰ Start time set: ${startDisp}`);
 
     // ── STEP 7: SET END TIME ──────────────────────────────────────────────
-    await page.mouse.click(END_TIME_X, DROPDOWNS_Y); // focus
-    await page.waitForTimeout(200);
-    await page.mouse.click(END_TIME_X, DROPDOWNS_Y); // open
+    // Open end time dropdown
+    const endControl = page.locator('#input-endTime').locator('xpath=ancestor::div[contains(@class,"select__control")]').first();
+    await endControl.waitFor({ timeout: 5000 });
+    await endControl.click();
+    await page.waitForTimeout(300);
+    await endControl.click();
     await page.waitForTimeout(300);
     await page.keyboard.type(endType);
     await page.waitForTimeout(300);
-    await page.evaluate((disp) => {
-      const opt = Array.from(document.querySelectorAll('.select__option'))
-        .filter(o => o.offsetParent)
-        .find(o => o.textContent.trim() === disp);
-      if (!opt) throw new Error(`End time option "${disp}" not found`);
-      opt.click();
-    }, endDisp);
+    await page.waitForSelector('.select__option', { timeout: 5000 });
+    const endOptions = await page.locator('.select__option').all();
+    let endClicked = false;
+    for (const opt of endOptions) {
+      const text = await opt.textContent();
+      if (text?.trim() === endDisp) { await opt.click(); endClicked = true; break; }
+    }
+    if (!endClicked) throw new Error(`End time option "${endDisp}" not found`);
     await page.waitForTimeout(300);
     console.log(`⏰ End time set: ${endDisp}`);
 
