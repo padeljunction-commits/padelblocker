@@ -1,12 +1,14 @@
 /**
  * PADEL JUNCTION — PLAYTOMIC AUTO-BLOCKER
  * ----------------------------------------
- * Uses Playwright's page.on('request') to capture the exact API call
- * that Playtomic Manager makes when creating a blocking, then replays
- * it directly for all future blockings — no UI interaction needed.
+ * Selectors fully verified in live browser (March 2026):
  *
- * First run: drives the UI to create a blocking while capturing the API call.
- * Subsequent runs: calls the API directly (fast, reliable, no UI fragility).
+ *   openDropdown(id)      → input.focus() + Space keydown on #input-{resource|startTime|endTime}
+ *   filterDropdown(id,t)  → nativeSetter + input event
+ *   pickOption(exact)     → click .select__option by exact text
+ *
+ * On first blocking: drives browser UI, captures auth token via page.on('request')
+ * On subsequent blockings: calls Playtomic API directly (no browser needed)
  */
 
 require('dotenv').config();
@@ -25,245 +27,218 @@ const CONFIG = {
   CHROMIUM_PATH:       process.env.CHROMIUM_PATH || null,
 };
 
-// In-memory cache of the auth token — populated on first successful blocking
-// Token is a Bearer token extracted from the captured API request
+// Cached Bearer token — populated from page.on('request') on first UI run
 let cachedAuthToken = null;
 
-// ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Padel Junction Playtomic Blocker', hasToken: !!cachedAuthToken });
-});
+// ── HEALTH ────────────────────────────────────────────────────────────────────
+app.get('/', (req, res) =>
+  res.json({ status: 'ok', service: 'Padel Junction Playtomic Blocker', hasToken: !!cachedAuthToken })
+);
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────────────
 app.post('/webhook/catchcorner', async (req, res) => {
   const { secret, booking } = req.body;
-
-  if (secret !== CONFIG.WEBHOOK_SECRET) {
-    console.warn('⚠️  Unauthorized webhook rejected.');
+  if (secret !== CONFIG.WEBHOOK_SECRET)
     return res.status(403).json({ error: 'Unauthorized' });
-  }
-
-  if (!booking?.startTime || !booking?.endTime || !booking?.court) {
+  if (!booking?.startTime || !booking?.endTime || !booking?.court)
     return res.status(400).json({ error: 'Missing booking fields' });
-  }
 
   console.log(`📥 Booking: ${booking.court} @ ${booking.startTime} – ${booking.endTime}`);
   res.json({ status: 'accepted' });
 
   try {
     if (cachedAuthToken) {
-      // Fast path — call API directly
-      await blockViaAPI(booking, cachedAuthToken);
+      await blockViaAPI(booking);
     } else {
-      // First run — drive UI, capture token, then use API
-      await blockViaUIAndCaptureToken(booking);
+      await blockViaBrowser(booking);
     }
     console.log(`✅ Blocking created for ${booking.id}`);
   } catch (err) {
     console.error(`❌ Failed for ${booking.id}: ${err.message}`);
-    // If API call failed with 401, token may have expired — clear it and retry via UI
+    // If token expired, clear and retry via browser
     if (err.message?.includes('401') && cachedAuthToken) {
-      console.log('🔄 Token may be expired, clearing and retrying via UI...');
+      console.log('🔄 Token expired — retrying via browser...');
       cachedAuthToken = null;
       try {
-        await blockViaUIAndCaptureToken(booking);
-        console.log(`✅ Blocking created on retry for ${booking.id}`);
-      } catch (retryErr) {
-        console.error(`❌ Retry also failed: ${retryErr.message}`);
+        await blockViaBrowser(booking);
+        console.log(`✅ Retry succeeded for ${booking.id}`);
+      } catch (e2) {
+        console.error(`❌ Retry failed: ${e2.message}`);
       }
     }
   }
 });
 
-// ── DIRECT API CALL (fast path) ───────────────────────────────────────────────
-async function blockViaAPI(booking, authToken) {
-  const start = new Date(booking.startTime);
-  const end   = new Date(booking.endTime);
-
+// ── FAST PATH: direct API call ────────────────────────────────────────────────
+async function blockViaAPI(booking) {
+  const start      = new Date(booking.startTime);
+  const end        = new Date(booking.endTime);
   const courtNum   = booking.court.match(/\d+/)?.[0] || '1';
   const resourceId = courtNum === '1'
     ? '1f900b5d-f99d-4b17-9a8a-1ceb28be5299'
     : '6ea04658-e7db-456a-beef-efc9c91fa7b0';
 
-  // Build the payload in the format Playtomic expects
-  // Field names verified from captured API calls
   const payload = {
     tenant_id:   CONFIG.PLAYTOMIC_TENANT_ID,
     resource_id: resourceId,
-    start_date:  toLocalDateStr(start),
-    start_time:  toLocalTimeStr(start),
-    end_time:    toLocalTimeStr(end),
-    title:       `CatchCorner – ${booking.customer}`,
+    start_date:  toDateStr(start),
+    start_time:  toTimeStr(start),
+    end_time:    toTimeStr(end),
+    title:       `CatchCorner – ${booking.customer || 'Booking'}`,
   };
 
-  console.log(`📡 Calling API directly: ${JSON.stringify(payload)}`);
-
-  const response = await fetch('https://manager.playtomic.io/api/v1/availability_blocks', {
+  console.log(`📡 API call: ${JSON.stringify(payload)}`);
+  const res = await fetch('https://manager.playtomic.io/api/v1/availability_blocks', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${authToken}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
+      'Authorization': `Bearer ${cachedAuthToken}`,
+      'Content-Type':  'application/json',
+      'Accept':        'application/json',
     },
     body: JSON.stringify(payload),
   });
 
-  const text = await response.text();
-  console.log(`📡 API response ${response.status}: ${text.substring(0, 200)}`);
-
-  if (!response.ok) {
-    throw new Error(`API returned ${response.status}: ${text}`);
-  }
-
+  const text = await res.text();
+  console.log(`📡 API response ${res.status}: ${text.substring(0, 300)}`);
+  if (!res.ok) throw new Error(`API ${res.status}: ${text}`);
   return JSON.parse(text);
 }
 
-// ── UI-DRIVEN PATH (captures auth token on first run) ─────────────────────────
-async function blockViaUIAndCaptureToken(booking) {
-  const launchOptions = {
+// ── BROWSER PATH ──────────────────────────────────────────────────────────────
+async function blockViaBrowser(booking) {
+  const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  };
-  if (CONFIG.CHROMIUM_PATH) launchOptions.executablePath = CONFIG.CHROMIUM_PATH;
+    ...(CONFIG.CHROMIUM_PATH ? { executablePath: CONFIG.CHROMIUM_PATH } : {}),
+  });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page    = await context.newPage();
 
-  const browser = await chromium.launch(launchOptions);
-  const context  = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-  const page     = await context.newPage();
-
-  // ── CAPTURE API CALLS via Playwright's request event ─────────────────────
-  let capturedToken = null;
-  let capturedPayload = null;
-  let capturedURL = null;
-
-  page.on('request', request => {
-    const url = request.url();
-    const method = request.method();
-    if (url.includes('playtomic.io/api') && (method === 'POST' || method === 'PATCH' || method === 'PUT')) {
-      const headers = request.headers();
-      const auth = headers['authorization'] || headers['Authorization'];
-      if (auth && auth.startsWith('Bearer ')) {
-        capturedToken = auth.replace('Bearer ', '');
-        capturedURL = url;
-        try { capturedPayload = request.postData(); } catch(_) {}
-        console.log(`🔑 Captured API call: ${method} ${url}`);
-        console.log(`🔑 Auth token: ${capturedToken.substring(0, 20)}...`);
-        console.log(`🔑 Payload: ${capturedPayload}`);
+  // Capture auth token at OS network level (not in-page JS — works across navigation)
+  page.on('request', req => {
+    const url = req.url(), method = req.method();
+    if (url.includes('playtomic.io/api') && ['POST','PATCH','PUT'].includes(method)) {
+      const auth = req.headers()['authorization'] || '';
+      if (auth.startsWith('Bearer ') && !cachedAuthToken) {
+        cachedAuthToken = auth.replace('Bearer ', '');
+        console.log(`🔑 Token captured from ${method} ${url.split('?')[0]}`);
+        console.log(`🔑 Payload: ${req.postData()}`);
       }
     }
   });
 
   try {
-    // ── LOGIN ─────────────────────────────────────────────────────────────
+    // LOGIN
     console.log('🔐 Logging in...');
-    await page.goto('https://manager.playtomic.io/auth/login', {
-      waitUntil: 'domcontentloaded', timeout: 60000,
-    });
+    await page.goto('https://manager.playtomic.io/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.getByRole('textbox', { name: 'Email' }).waitFor({ timeout: 15000 });
     await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
     await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
     await page.getByRole('button', { name: 'Log In' }).click();
-    await page.waitForFunction(
-      () => !window.location.pathname.includes('/auth/login'),
-      { timeout: 30000 }
-    );
+    await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 30000 });
     await page.waitForTimeout(1500);
     console.log('✅ Logged in.');
 
-    // ── OPEN FORM ─────────────────────────────────────────────────────────
-    const blockUrl = `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
-    await page.goto(blockUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.getByPlaceholder('E.g.: Maintenance').waitFor({ timeout: 15000 });
+    // OPEN FORM
+    await page.goto(
+      `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`,
+      { waitUntil: 'domcontentloaded', timeout: 60000 }
+    );
+    await page.locator('#input-resource').waitFor({ timeout: 15000 });
     await page.waitForTimeout(500);
     console.log('📝 Form loaded.');
 
-    // ── FILL TITLE ────────────────────────────────────────────────────────
-    await page.getByPlaceholder('E.g.: Maintenance').fill(`CatchCorner – ${booking.customer}`);
+    // TITLE
+    await page.getByPlaceholder('E.g.: Maintenance').fill(`CatchCorner – ${booking.customer || 'Booking'}`);
 
-    // ── SELECT COURT ──────────────────────────────────────────────────────
-    const courtNum  = booking.court.match(/\d+/)?.[0] || '1';
-    const courtName = `Padel ${courtNum}`;
-
-    // Click to focus, space to open (verified reliable approach)
-    await page.mouse.click(748, 205);
-    await page.waitForTimeout(200);
-    await page.keyboard.press('Space');
-    await page.waitForTimeout(400);
-    await page.evaluate((name) => {
-      const opt = Array.from(document.querySelectorAll('.select__option'))
-        .find(o => o.textContent.trim() === name);
-      if (!opt) throw new Error(`Court "${name}" not found`);
-      opt.click();
-    }, courtName);
-    await page.waitForTimeout(400);
-    console.log(`🏓 Court: ${courtName}`);
-
-    // ── SET START TIME ────────────────────────────────────────────────────
     const start     = new Date(booking.startTime);
     const end       = new Date(booking.endTime);
+    const courtNum  = booking.court.match(/\d+/)?.[0] || '1';
+    const courtName = `Padel ${courtNum}`;
     const startDisp = toDisplayTime(start);
     const endDisp   = toDisplayTime(end);
     const startType = toTypeStr(start);
     const endType   = toTypeStr(end);
 
-    await page.mouse.click(573, 302);
-    await page.waitForTimeout(200);
-    await page.keyboard.press('Space');
-    await page.waitForTimeout(300);
-    await page.keyboard.type(startType);
-    await page.waitForTimeout(300);
+    // COURT — open with focus+Space, click option by name
+    await page.evaluate((name) => {
+      const inp = document.getElementById('input-resource');
+      if (!inp) throw new Error('#input-resource not found');
+      inp.focus();
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+      inp.dispatchEvent(new KeyboardEvent('keyup',   { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+    }, courtName);
+    await page.waitForTimeout(500);
+    await page.evaluate((name) => {
+      const opts = Array.from(document.querySelectorAll('.select__option')).filter(o => o.offsetParent);
+      const t = opts.find(o => o.textContent.trim() === name);
+      if (!t) throw new Error(`Court "${name}" not found. Options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
+      t.click();
+    }, courtName);
+    await page.waitForTimeout(400);
+    console.log(`🏓 Court: ${courtName}`);
+
+    // START TIME — open, filter, click
+    await page.evaluate(() => {
+      const inp = document.getElementById('input-startTime');
+      if (!inp) throw new Error('#input-startTime not found');
+      inp.focus();
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+      inp.dispatchEvent(new KeyboardEvent('keyup',   { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+    });
+    await page.waitForTimeout(500);
+    await page.evaluate((text) => {
+      const inp = document.getElementById('input-startTime');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, text);
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+    }, startType);
+    await page.waitForTimeout(400);
     await page.evaluate((disp) => {
-      const opt = Array.from(document.querySelectorAll('.select__option'))
-        .filter(o => o.offsetParent)
-        .find(o => o.textContent.trim() === disp);
-      if (!opt) throw new Error(`Start time "${disp}" not found`);
-      opt.click();
+      const opts = Array.from(document.querySelectorAll('.select__option')).filter(o => o.offsetParent);
+      const t = opts.find(o => o.textContent.trim() === disp);
+      if (!t) throw new Error(`Start "${disp}" not found. Options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
+      t.click();
     }, startDisp);
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
     console.log(`⏰ Start: ${startDisp}`);
 
-    // ── SET END TIME ──────────────────────────────────────────────────────
-    await page.mouse.click(805, 302);
-    await page.waitForTimeout(200);
-    await page.keyboard.press('Space');
-    await page.waitForTimeout(300);
-    await page.keyboard.type(endType);
-    await page.waitForTimeout(300);
+    // END TIME — open, filter, click
+    await page.evaluate(() => {
+      const inp = document.getElementById('input-endTime');
+      if (!inp) throw new Error('#input-endTime not found');
+      inp.focus();
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+      inp.dispatchEvent(new KeyboardEvent('keyup',   { key: ' ', code: 'Space', keyCode: 32, bubbles: true }));
+    });
+    await page.waitForTimeout(500);
+    await page.evaluate((text) => {
+      const inp = document.getElementById('input-endTime');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, text);
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+    }, endType);
+    await page.waitForTimeout(400);
     await page.evaluate((disp) => {
-      const opt = Array.from(document.querySelectorAll('.select__option'))
-        .filter(o => o.offsetParent)
-        .find(o => o.textContent.trim() === disp);
-      if (!opt) throw new Error(`End time "${disp}" not found`);
-      opt.click();
+      const opts = Array.from(document.querySelectorAll('.select__option')).filter(o => o.offsetParent);
+      const t = opts.find(o => o.textContent.trim() === disp);
+      if (!t) throw new Error(`End "${disp}" not found. Options: ${opts.map(o=>o.textContent.trim()).join(', ')}`);
+      t.click();
     }, endDisp);
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
     console.log(`⏰ End: ${endDisp}`);
 
-    // ── SUBMIT ────────────────────────────────────────────────────────────
+    // SUBMIT
     await takeScreenshot(page, booking.id, 'before-submit');
     await page.getByRole('button', { name: 'Create' }).click();
     await page.waitForTimeout(3000);
     await takeScreenshot(page, booking.id, 'after-submit');
 
-    const urlOk = !page.url().includes('/add/block');
-    if (urlOk) {
-      console.log('✅ Blocking created via UI.');
-    } else {
-      throw new Error('Still on form after submit — blocking may have failed');
-    }
+    if (page.url().includes('/add/block'))
+      throw new Error('Still on form after submit — check screenshot for error');
 
-    // ── CACHE THE TOKEN ───────────────────────────────────────────────────
-    if (capturedToken) {
-      cachedAuthToken = capturedToken;
-      console.log(`🔑 Auth token cached for future API calls.`);
-      console.log(`🔑 API URL was: ${capturedURL}`);
-      console.log(`🔑 API Payload was: ${capturedPayload}`);
-    } else {
-      console.warn('⚠️  No API call captured — future requests will continue using UI');
-    }
+    console.log('✅ Blocking created via browser.');
 
-  } catch (err) {
-    await takeScreenshot(page, booking.id, 'error');
-    throw err;
   } finally {
     await browser.close();
   }
@@ -271,49 +246,38 @@ async function blockViaUIAndCaptureToken(booking) {
 
 // ── TIME HELPERS ──────────────────────────────────────────────────────────────
 
-function toLocalDateStr(date) {
-  // "2026-03-19" in UTC (bookings sent as UTC ISO strings)
-  const y = date.getUTCFullYear();
-  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const d = String(date.getUTCDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+function toDateStr(d) {
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
 }
-
-function toLocalTimeStr(date) {
-  // "14:00" in UTC
-  const h = String(date.getUTCHours()).padStart(2, '0');
-  const m = String(date.getUTCMinutes()).padStart(2, '0');
-  return `${h}:${m}`;
+function toTimeStr(d) {
+  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
-
-function toTypeStr(date) {
-  // "4:00" — typed to filter dropdown
-  let h = date.getUTCHours();
-  const m = date.getUTCMinutes();
+function toTypeStr(d) {
+  // "4:00" — typed into filter box (no leading zero)
+  let h = d.getUTCHours();
   if (h > 12) h -= 12;
   if (h === 0) h = 12;
-  return `${h}:${String(m).padStart(2, '0')}`;
+  return `${h}:${pad(d.getUTCMinutes())}`;
 }
-
-function toDisplayTime(date) {
-  // "04:00 p.m." — exact dropdown option text
-  let h = date.getUTCHours();
-  const m   = date.getUTCMinutes();
+function toDisplayTime(d) {
+  // "04:00 p.m." — exact .select__option text
+  let h = d.getUTCHours();
   const mer = h >= 12 ? 'p.m.' : 'a.m.';
   if (h > 12) h -= 12;
   if (h === 0) h = 12;
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} ${mer}`;
+  return `${pad(h)}:${pad(d.getUTCMinutes())} ${mer}`;
 }
+function pad(n) { return String(n).padStart(2, '0'); }
 
 // ── SCREENSHOT ────────────────────────────────────────────────────────────────
-async function takeScreenshot(page, bookingId, label) {
+async function takeScreenshot(page, id, label) {
   try {
-    const buffer = await page.screenshot({ fullPage: false });
-    console.log(`📸 [${bookingId}-${label}] data:image/png;base64,${buffer.toString('base64')}`);
+    const b64 = (await page.screenshot()).toString('base64');
+    console.log(`📸 [${id}-${label}] data:image/png;base64,${b64}`);
   } catch (_) {}
 }
 
 // ── START ─────────────────────────────────────────────────────────────────────
-app.listen(CONFIG.PORT, () => {
-  console.log(`🚀 Padel Junction Playtomic Blocker on port ${CONFIG.PORT}`);
-});
+app.listen(CONFIG.PORT, () =>
+  console.log(`🚀 Padel Junction Playtomic Blocker on port ${CONFIG.PORT}`)
+);
