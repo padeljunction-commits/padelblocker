@@ -248,29 +248,50 @@ async function blockViaBrowser(booking) {
 }
 
 // ── TIME HELPERS ──────────────────────────────────────────────────────────────
+// All UI times must be in club local time (America/Toronto).
+// The Playtomic Manager form shows and accepts local time only.
+// Webhook startTime/endTime arrive as UTC ISO strings — convert before use.
 
+const CLUB_TZ = 'America/Toronto';
+
+function pad(n) { return String(n).padStart(2, '0'); }
+
+// Extract local {h, m} in club timezone from a UTC Date
+function localHM(d) {
+  // "14:00" style from en-CA 24h
+  const s = d.toLocaleTimeString('en-CA', { timeZone: CLUB_TZ, hour12: false, hour: '2-digit', minute: '2-digit' });
+  const [h, m] = s.split(':').map(Number);
+  return { h, m };
+}
+
+// "2026-03-19" in club local timezone
 function toDateStr(d) {
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
+  return d.toLocaleDateString('en-CA', { timeZone: CLUB_TZ }); // en-CA → YYYY-MM-DD
 }
+
+// "18:00" in club local timezone — for direct API calls
 function toTimeStr(d) {
-  return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+  const { h, m } = localHM(d);
+  return `${pad(h)}:${pad(m)}`;
 }
+
+// "6:00" — typed into filter box (no leading zero, 12h, local time)
 function toTypeStr(d) {
-  // "4:00" — typed into filter box (no leading zero)
-  let h = d.getUTCHours();
+  let { h, m } = localHM(d);
   if (h > 12) h -= 12;
   if (h === 0) h = 12;
-  return `${h}:${pad(d.getUTCMinutes())}`;
+  return `${h}:${pad(m)}`;
 }
+
+// "06:00 p.m." — exact dropdown option text (local time)
+// norm() in pickOption handles both "p.m." and "PM" formats across browsers
 function toDisplayTime(d) {
-  // "04:00 p.m." — exact .select__option text
-  let h = d.getUTCHours();
+  let { h, m } = localHM(d);
   const mer = h >= 12 ? 'p.m.' : 'a.m.';
   if (h > 12) h -= 12;
   if (h === 0) h = 12;
-  return `${pad(h)}:${pad(d.getUTCMinutes())} ${mer}`;
+  return `${pad(h)}:${pad(m)} ${mer}`;
 }
-function pad(n) { return String(n).padStart(2, '0'); }
 
 // ── SCREENSHOT ────────────────────────────────────────────────────────────────
 async function takeScreenshot(page, id, label) {
