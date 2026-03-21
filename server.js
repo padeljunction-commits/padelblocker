@@ -160,6 +160,19 @@ async function blockViaBrowser(booking) {
     const startType = toTypeStr(start);
     const endType   = toTypeStr(end);
 
+    // DATE — set the date field to the booking's local date
+    const dateStr = toDateStr(start);  // "2026-03-25" in Toronto timezone
+    await page.evaluate((dateVal) => {
+      const inp = document.getElementById('input-startDate');
+      if (!inp) throw new Error('#input-startDate not found');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(inp, dateVal);
+      inp.dispatchEvent(new Event('input',  { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+    }, dateStr);
+    await page.waitForTimeout(300);
+    console.log(`📆 Date: ${dateStr}`);
+
     // COURT — open with focus+Space, click option by name
     await page.evaluate((name) => {
       const inp = document.getElementById('input-resource');
