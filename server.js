@@ -1,35 +1,32 @@
 /**
  * PADEL JUNCTION — PLAYTOMIC AUTO-BLOCKER
  * ----------------------------------------
- * Pure API — no Playwright, no browser.
+ * Auth strategy:
+ *   Cold start / token expired → Playwright browser login → capture Bearer token
+ *   All bookings → direct API call (no browser)
  *
- * Auth strategy (fully tested live March 2026):
- *   On startup:  POST /api/v2/auth/token { grant_type: refresh_token, refresh_token }
- *   On 401:      same — force a fresh refresh
- *   After every successful refresh: update PLAYTOMIC_REFRESH_TOKEN in Railway via GraphQL
- *   so the env var stays perpetually fresh across restarts/deploys.
+ * Browser is ONLY used to get a token. Never to fill forms.
+ * Token lives in memory. On 401 or expiry → re-login via browser.
  *
- * Blocking (fully tested live March 2026):
+ * Blocking endpoint + payload shape verified live March 2026:
  *   POST /api/v1/availability/availability_blocks
  *   { name, resource_ids[], start: UTC ISO, end: UTC ISO, tenant_id }
  */
 
 require('dotenv').config();
-const express = require('express');
+const express      = require('express');
+const { chromium } = require('playwright-core');
 
 const app = express();
 app.use(express.json());
 
-// ── CONFIG ────────────────────────────────────────────────────────────────────
 const CONFIG = {
-  PORT:                    process.env.PORT || 3000,
-  WEBHOOK_SECRET:          process.env.WEBHOOK_SECRET,
-  PLAYTOMIC_TENANT_ID:     process.env.PLAYTOMIC_TENANT_ID,
-  PLAYTOMIC_REFRESH_TOKEN: process.env.PLAYTOMIC_REFRESH_TOKEN,
-  RAILWAY_API_TOKEN:       process.env.RAILWAY_API_TOKEN,
-  RAILWAY_PROJECT_ID:      process.env.RAILWAY_PROJECT_ID      || 'e6770e59-9287-43ce-aa4b-157b28f6969c',
-  RAILWAY_ENV_ID:          process.env.RAILWAY_ENV_ID          || '93deb196-c678-470d-b6fd-d1922153dc87',
-  RAILWAY_SERVICE_ID:      process.env.RAILWAY_SERVICE_ID      || 'e7bca5d4-b55c-4802-b4b4-853c07c513e8',
+  PORT:                process.env.PORT || 3000,
+  WEBHOOK_SECRET:      process.env.WEBHOOK_SECRET,
+  PLAYTOMIC_EMAIL:     process.env.PLAYTOMIC_EMAIL,
+  PLAYTOMIC_PASSWORD:  process.env.PLAYTOMIC_PASSWORD,
+  PLAYTOMIC_TENANT_ID: process.env.PLAYTOMIC_TENANT_ID,
+  CHROMIUM_PATH:       process.env.CHROMIUM_PATH || null,
 };
 
 const PLAYTOMIC_BASE = 'https://manager.playtomic.io';
@@ -40,81 +37,77 @@ const RESOURCE_IDS = {
 };
 
 let tokenState = {
-  accessToken:           null,
-  accessTokenExpiration: null,
-  refreshToken:          CONFIG.PLAYTOMIC_REFRESH_TOKEN || null,
+  accessToken: null,
+  expiresAt:   null,
 };
 
-// ── RAILWAY ENV VAR UPDATE ────────────────────────────────────────────────────
+let loginInProgress = null;
 
-async function persistRefreshTokenToRailway(newRefreshToken) {
-  if (!CONFIG.RAILWAY_API_TOKEN) {
-    console.log('⚠️  RAILWAY_API_TOKEN not set — token will not survive restarts');
-    return;
+// ── BROWSER LOGIN ─────────────────────────────────────────────────────────────
+
+async function captureTokenViaBrowser() {
+  if (loginInProgress) {
+    console.log('⏳ Browser login already in progress — waiting...');
+    return loginInProgress;
   }
-  try {
-    const res = await fetch('https://backboard.railway.com/graphql/v2', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${CONFIG.RAILWAY_API_TOKEN}`,
-        'Content-Type':  'application/json',
-      },
-      body: JSON.stringify({
-        query: `mutation {
-          variableUpsert(input: {
-            projectId:     "${CONFIG.RAILWAY_PROJECT_ID}"
-            environmentId: "${CONFIG.RAILWAY_ENV_ID}"
-            serviceId:     "${CONFIG.RAILWAY_SERVICE_ID}"
-            name:          "PLAYTOMIC_REFRESH_TOKEN"
-            value:         "${newRefreshToken}"
-          })
-        }`
-      }),
-    });
-    const data = await res.json();
-    if (data?.data?.variableUpsert === true) {
-      console.log('🔁 Refresh token persisted to Railway env var.');
-    } else {
-      console.error('⚠️  Railway env var update failed:', JSON.stringify(data));
-    }
-  } catch (e) {
-    console.error('⚠️  Railway env var update error:', e.message);
-  }
+  loginInProgress = _doBrowserLogin().finally(() => { loginInProgress = null; });
+  return loginInProgress;
 }
 
-// ── TOKEN REFRESH ─────────────────────────────────────────────────────────────
+async function _doBrowserLogin() {
+  console.log('🌐 Starting browser login to capture token...');
 
-async function refreshAccessToken() {
-  if (!tokenState.refreshToken) {
-    throw new Error('No refresh token. Set PLAYTOMIC_REFRESH_TOKEN in Railway env vars.');
-  }
-  console.log('🔄 Refreshing Playtomic access token...');
-  const res = await fetch(`${PLAYTOMIC_BASE}/api/v2/auth/token`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ grant_type: 'refresh_token', refresh_token: tokenState.refreshToken }),
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    ...(CONFIG.CHROMIUM_PATH ? { executablePath: CONFIG.CHROMIUM_PATH } : {}),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Token refresh failed ${res.status}: ${text}`);
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  const page    = await context.newPage();
+  let capturedToken = null;
+
+  page.on('request', req => {
+    if (capturedToken) return;
+    const auth = req.headers()['authorization'] || '';
+    if (req.url().includes('playtomic.io/api') && auth.startsWith('Bearer ')) {
+      capturedToken = auth.replace('Bearer ', '');
+      console.log('🔑 Token captured.');
+    }
+  });
+
+  try {
+    await page.goto(`${PLAYTOMIC_BASE}/auth/login`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.getByRole('textbox', { name: 'Email' }).waitFor({ timeout: 15000 });
+    await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
+    await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
+    await page.getByRole('button', { name: 'Log In' }).click();
+    await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 30000 });
+    console.log('✅ Logged in — waiting for token...');
+
+    const start = Date.now();
+    while (!capturedToken && Date.now() - start < 10000) {
+      await page.waitForTimeout(200);
+    }
+    if (!capturedToken) throw new Error('Logged in but no token captured within 10s');
+
+    tokenState = { accessToken: capturedToken, expiresAt: Date.now() + 55 * 60 * 1000 };
+    console.log('✅ Token stored. Valid for ~55 min.');
+    return capturedToken;
+
+  } finally {
+    await browser.close();
   }
-  const data = await res.json();
-  tokenState = {
-    accessToken:           data.access_token,
-    accessTokenExpiration: data.access_token_expiration,
-    refreshToken:          data.refresh_token,
-  };
-  console.log(`✅ Token refreshed. Expires: ${tokenState.accessTokenExpiration}`);
-  await persistRefreshTokenToRailway(data.refresh_token);
-  return tokenState.accessToken;
 }
+
+// ── TOKEN ─────────────────────────────────────────────────────────────────────
 
 async function getAccessToken() {
-  if (tokenState.accessToken && tokenState.accessTokenExpiration) {
-    const expiresAt = new Date(tokenState.accessTokenExpiration).getTime();
-    if (Date.now() < expiresAt - 60_000) return tokenState.accessToken;
+  if (tokenState.accessToken && Date.now() < tokenState.expiresAt) {
+    return tokenState.accessToken;
   }
-  return refreshAccessToken();
+  console.log('🔄 Token missing/expired — browser login...');
+  return captureTokenViaBrowser();
 }
 
 // ── CREATE BLOCK ──────────────────────────────────────────────────────────────
@@ -132,28 +125,28 @@ async function createBlock(booking) {
     tenant_id:    CONFIG.PLAYTOMIC_TENANT_ID,
   };
 
-  console.log(`📡 Creating block: ${JSON.stringify(payload)}`);
+  console.log(`📡 Block payload: ${JSON.stringify(payload)}`);
+
+  const doRequest = async (token) => fetch(
+    `${PLAYTOMIC_BASE}/api/v1/availability/availability_blocks`,
+    {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body:    JSON.stringify(payload),
+    }
+  );
 
   const token = await getAccessToken();
-  const res = await fetch(`${PLAYTOMIC_BASE}/api/v1/availability/availability_blocks`, {
-    method:  'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body:    JSON.stringify(payload),
-  });
-
-  const text = await res.text();
+  const res   = await doRequest(token);
+  const text  = await res.text();
   console.log(`📡 Response ${res.status}: ${text.substring(0, 300)}`);
 
   if (res.status === 401) {
-    console.log('🔄 401 — forcing token refresh and retrying...');
+    console.log('🔄 401 — re-authenticating via browser...');
     tokenState.accessToken = null;
     const freshToken = await getAccessToken();
-    const retry = await fetch(`${PLAYTOMIC_BASE}/api/v1/availability/availability_blocks`, {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${freshToken}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body:    JSON.stringify(payload),
-    });
-    const retryText = await retry.text();
+    const retry      = await doRequest(freshToken);
+    const retryText  = await retry.text();
     console.log(`📡 Retry ${retry.status}: ${retryText.substring(0, 300)}`);
     if (!retry.ok) throw new Error(`API ${retry.status}: ${retryText}`);
     return JSON.parse(retryText);
@@ -166,10 +159,10 @@ async function createBlock(booking) {
 // ── HEALTH ────────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Padel Junction Playtomic Blocker',
-  hasRefreshToken: !!tokenState.refreshToken,
-  hasAccessToken:  !!tokenState.accessToken,
-  tokenExpires:    tokenState.accessTokenExpiration || 'not yet fetched',
+  status:   'ok',
+  service:  'Padel Junction Playtomic Blocker',
+  hasToken: !!tokenState.accessToken,
+  tokenMinutesRemaining: tokenState.expiresAt ? Math.round((tokenState.expiresAt - Date.now()) / 60000) : null,
 }));
 
 // ── WEBHOOK ───────────────────────────────────────────────────────────────────
@@ -195,14 +188,13 @@ app.post('/webhook/catchcorner', async (req, res) => {
 
 app.listen(CONFIG.PORT, async () => {
   console.log(`🚀 Padel Junction Playtomic Blocker on port ${CONFIG.PORT}`);
-  console.log(`   Refresh token: ${tokenState.refreshToken ? '✅ loaded' : '❌ MISSING'}`);
-  console.log(`   Railway token: ${CONFIG.RAILWAY_API_TOKEN ? '✅ loaded' : '⚠️  not set'}`);
-  if (tokenState.refreshToken) {
-    try {
-      await refreshAccessToken();
-      console.log('✅ Startup token refresh complete.');
-    } catch (e) {
-      console.error(`❌ Startup token refresh failed: ${e.message}`);
-    }
+  console.log(`   Email: ${CONFIG.PLAYTOMIC_EMAIL ? '✅' : '❌ MISSING'}`);
+  console.log(`   Password: ${CONFIG.PLAYTOMIC_PASSWORD ? '✅' : '❌ MISSING'}`);
+  try {
+    await captureTokenViaBrowser();
+    console.log('✅ Startup login complete — ready for bookings.');
+  } catch (e) {
+    console.error(`❌ Startup login failed: ${e.message}`);
+    console.log('⚠️  Will retry on first booking.');
   }
 });
