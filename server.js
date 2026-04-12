@@ -2,15 +2,11 @@
  * PADEL JUNCTION — PLAYTOMIC AUTO-BLOCKER
  * ----------------------------------------
  * Auth strategy:
- *   Cold start / token expired → Playwright browser login → capture Bearer token
+ *   Cold start / token expired → Playwright browser login → read token from localStorage
  *   All bookings → direct API call (no browser)
  *
- * Browser is ONLY used to get a token. Never to fill forms.
- * Token lives in memory. On 401 or expiry → re-login via browser.
- *
- * Blocking endpoint + payload shape verified live March 2026:
- *   POST /api/v1/availability/availability_blocks
- *   { name, resource_ids[], start: UTC ISO, end: UTC ISO, tenant_id }
+ * Token is read from localStorage after login (playtomic:auth.accessToken).
+ * This is more reliable than intercepting network requests.
  */
 
 require('dotenv').config();
@@ -65,16 +61,6 @@ async function _doBrowserLogin() {
 
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page    = await context.newPage();
-  let capturedToken = null;
-
-  page.on('request', req => {
-    if (capturedToken) return;
-    const auth = req.headers()['authorization'] || '';
-    if (req.url().includes('playtomic.io/api') && ['POST','PATCH','PUT'].includes(req.method()) && auth.startsWith('Bearer ')) {
-      capturedToken = auth.replace('Bearer ', '');
-      console.log('🔑 Token captured.');
-    }
-  });
 
   try {
     await page.goto(`${PLAYTOMIC_BASE}/auth/login`, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -82,18 +68,43 @@ async function _doBrowserLogin() {
     await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
     await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
     await page.getByRole('button', { name: 'Log In' }).click();
-    await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 30000 });
-    console.log('✅ Logged in — waiting for token...');
 
-    const start = Date.now();
-    while (!capturedToken && Date.now() - start < 10000) {
-      await page.waitForTimeout(200);
+    // Wait for redirect away from login page
+    await page.waitForFunction(
+      () => !window.location.pathname.includes('/auth/login'),
+      { timeout: 30000 }
+    );
+
+    // Wait for page to fully load and write tokens to localStorage
+    await page.waitForTimeout(3000);
+
+    // Read token directly from localStorage — reliable, no network interception needed
+    const auth = await page.evaluate(() => {
+      try {
+        const raw = localStorage.getItem('playtomic:auth');
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        return {
+          accessToken:           data.accessToken,
+          accessTokenExpiration: data.accessTokenExpiration,
+        };
+      } catch(e) {
+        return null;
+      }
+    });
+
+    if (!auth?.accessToken) {
+      throw new Error('Logged in but playtomic:auth not found in localStorage');
     }
-    if (!capturedToken) throw new Error('Logged in but no token captured within 10s');
 
-    tokenState = { accessToken: capturedToken, expiresAt: Date.now() + 55 * 60 * 1000 };
-    console.log('✅ Token stored. Valid for ~55 min.');
-    return capturedToken;
+    // Use the real expiry from Playtomic, with a 5 minute buffer
+    const expiresAt = auth.accessTokenExpiration
+      ? new Date(auth.accessTokenExpiration).getTime() - 5 * 60 * 1000
+      : Date.now() + 55 * 60 * 1000;
+
+    tokenState = { accessToken: auth.accessToken, expiresAt };
+    console.log(`🔑 Token captured from localStorage. Expires: ${auth.accessTokenExpiration}`);
+    return auth.accessToken;
 
   } finally {
     await browser.close();
