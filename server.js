@@ -70,7 +70,7 @@ async function _doBrowserLogin() {
   page.on('request', req => {
     if (capturedToken) return;
     const auth = req.headers()['authorization'] || '';
-    if (req.url().includes('playtomic.io/api') && auth.startsWith('Bearer ')) {
+    if (req.url().includes('playtomic.io/api') && ['POST','PATCH','PUT'].includes(req.method()) && auth.startsWith('Bearer ')) {
       capturedToken = auth.replace('Bearer ', '');
       console.log('🔑 Token captured.');
     }
