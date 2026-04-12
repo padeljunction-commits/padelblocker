@@ -20,6 +20,15 @@ const RESOURCE_IDS = {
   '2': '6ea04658-e7db-456a-beef-efc9c91fa7b0',
 };
 
+const BROWSER_HEADERS = {
+  'Accept':          'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Origin':          PLAYTOMIC_BASE,
+  'Referer':         `${PLAYTOMIC_BASE}/`,
+  'User-Agent':      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'X-Requested-With':'XMLHttpRequest',
+};
+
 let tokenState = { accessToken: null, expiresAt: null };
 let loginInProgress = null;
 
@@ -93,54 +102,104 @@ async function createBlock(booking) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 15000);
     try {
+      console.log('📡 Sending POST to Playtomic...');
       const r = await fetch(`${PLAYTOMIC_BASE}/api/v1/availability/availability_blocks`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type':  'application/json',
+          ...BROWSER_HEADERS,
+        },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
+      console.log(`📡 Headers received. Status: ${r.status}`);
+      console.log(`📡 Response headers: ${JSON.stringify(Object.fromEntries(r.headers))}`);
+
+      // fetch's AbortController doesn't cover body reads — give res.text() its own timeout
+      // so a Cloudflare challenge / chunked stream that never closes can't hang us forever.
+      const bodyText = await Promise.race([
+        r.text(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('body read timeout after 10s')), 10000)),
+      ]);
       clearTimeout(t);
-      return r;
-    } catch(e) {
+      return { status: r.status, ok: r.ok, text: bodyText, headers: r.headers };
+    } catch (e) {
       clearTimeout(t);
+      console.log(`❌ doRequest threw: ${e.name} - ${e.message}`);
       throw e;
     }
   };
 
   const token = await getAccessToken();
   const res   = await doRequest(token);
-  const text  = await res.text();
-  console.log(`📡 Response ${res.status}: ${text.substring(0, 300)}`);
+  console.log(`📡 Response ${res.status}: ${res.text.substring(0, 500)}`);
+
   if (res.status === 401) {
     console.log('🔄 401 — re-authenticating...');
     tokenState.accessToken = null;
     const fresh = await getAccessToken();
     const retry = await doRequest(fresh);
-    const rt    = await retry.text();
-    console.log(`📡 Retry ${retry.status}: ${rt.substring(0, 300)}`);
-    if (!retry.ok) throw new Error(`API ${retry.status}: ${rt}`);
-    return JSON.parse(rt);
+    console.log(`📡 Retry ${retry.status}: ${retry.text.substring(0, 500)}`);
+    if (!retry.ok) throw new Error(`API ${retry.status}: ${retry.text}`);
+    return JSON.parse(retry.text);
   }
-  if (!res.ok) throw new Error(`API ${res.status}: ${text}`);
-  return JSON.parse(text);
+  if (!res.ok) throw new Error(`API ${res.status}: ${res.text}`);
+  return JSON.parse(res.text);
 }
 
-// ── PING — tests outbound connectivity from Railway ───────────────────────────
+// ── PING (GET) — tests basic outbound connectivity ────────────────────────────
 app.get('/ping', async (req, res) => {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 8000);
   try {
-    const r = await fetch('https://manager.playtomic.io/api/v1/tenants/47a6875c-4bef-461b-bb7c-8fb21dbffbf0', { signal: controller.signal });
+    const r = await fetch(`${PLAYTOMIC_BASE}/api/v1/tenants/47a6875c-4bef-461b-bb7c-8fb21dbffbf0`, {
+      headers: BROWSER_HEADERS,
+      signal: controller.signal,
+    });
     clearTimeout(t);
     res.json({ reachable: true, status: r.status });
-  } catch(e) {
+  } catch (e) {
+    clearTimeout(t);
+    res.json({ reachable: false, error: e.name, message: e.message });
+  }
+});
+
+// ── PING (POST) — tests whether Railway → Playtomic POSTs work at all ─────────
+// Expected: 400 or 401 (no auth, empty body). Anything else = blocked/challenged.
+app.get('/ping-post', async (req, res) => {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 10000);
+  try {
+    const r = await fetch(`${PLAYTOMIC_BASE}/api/v1/availability/availability_blocks`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...BROWSER_HEADERS,
+      },
+      body: '{}',
+      signal: controller.signal,
+    });
+    const text = await Promise.race([
+      r.text(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('body read timeout')), 8000)),
+    ]);
+    clearTimeout(t);
+    res.json({
+      reachable: true,
+      status:    r.status,
+      body:      text.substring(0, 300),
+      headers:   Object.fromEntries(r.headers),
+    });
+  } catch (e) {
     clearTimeout(t);
     res.json({ reachable: false, error: e.name, message: e.message });
   }
 });
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', service: 'Padel Junction Playtomic Blocker',
+  status: 'ok',
+  service: 'Padel Junction Playtomic Blocker',
   hasToken: !!tokenState.accessToken,
   tokenMinutesRemaining: tokenState.expiresAt ? Math.round((tokenState.expiresAt - Date.now()) / 60000) : null,
 }));
