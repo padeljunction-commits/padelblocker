@@ -32,6 +32,16 @@ const BROWSER_HEADERS = {
 let tokenState = { accessToken: null, expiresAt: null };
 let loginInProgress = null;
 
+function decodeJwtPayload(token) {
+  try {
+    const part = token.split('.')[1];
+    const b64  = part.replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
 async function captureTokenViaBrowser() {
   if (loginInProgress) return loginInProgress;
   loginInProgress = _doBrowserLogin().finally(() => { loginInProgress = null; });
@@ -47,14 +57,14 @@ async function _doBrowserLogin() {
   });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page    = await context.newPage();
-  let capturedToken = null;
 
+  // Collect ALL bearer tokens we see during login. Playtomic issues several
+  // and only the post-dashboard one carries ROLE_TENANT_MANAGER.
+  const candidateTokens = new Set();
   page.on('request', req => {
-    if (capturedToken) return;
     const auth = req.headers()['authorization'] || '';
     if (req.url().includes('playtomic.io/api') && auth.startsWith('Bearer ')) {
-      capturedToken = auth.replace('Bearer ', '');
-      console.log('🔑 Token captured.');
+      candidateTokens.add(auth.replace('Bearer ', ''));
     }
   });
 
@@ -65,15 +75,44 @@ async function _doBrowserLogin() {
     await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
     await page.getByRole('button', { name: 'Log In' }).click();
     await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 30000 });
-    console.log('✅ Logged in — waiting for token...');
-    const start = Date.now();
-    while (!capturedToken && Date.now() - start < 10000) {
-      await page.waitForTimeout(200);
+    console.log('✅ Logged in.');
+
+    // Navigate to the dashboard to force the manager-scoped token to be emitted
+    console.log('📊 Loading dashboard to trigger manager-scoped token...');
+    await page.goto(
+      `${PLAYTOMIC_BASE}/dashboard/schedule?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`,
+      { waitUntil: 'networkidle', timeout: 30000 }
+    ).catch(() => {}); // networkidle can flake — we just need it to load enough
+    // Give late XHRs a moment to fire
+    await page.waitForTimeout(2000);
+
+    console.log(`🔑 Captured ${candidateTokens.size} candidate token(s). Selecting manager-scoped one...`);
+
+    let bestToken = null;
+    let bestExp   = null;
+    for (const tok of candidateTokens) {
+      const payload = decodeJwtPayload(tok);
+      if (!payload) continue;
+      const scopes = payload.scopes || [];
+      const hasManager = scopes.includes('ROLE_TENANT_MANAGER');
+      console.log(`  - sub=${payload.sub} scopes=[${scopes.join(',')}] manager=${hasManager}`);
+      if (hasManager) {
+        bestToken = tok;
+        bestExp   = payload.exp ? payload.exp * 1000 : null;
+      }
     }
-    if (!capturedToken) throw new Error('Logged in but no token captured within 10s');
-    tokenState = { accessToken: capturedToken, expiresAt: Date.now() + 55 * 60 * 1000 };
-    console.log('✅ Token stored. Valid for ~55 min.');
-    return capturedToken;
+
+    if (!bestToken) {
+      throw new Error(`No token with ROLE_TENANT_MANAGER found among ${candidateTokens.size} candidates`);
+    }
+
+    const expiresAt = bestExp
+      ? bestExp - 60_000  // 1 min safety buffer before real expiry
+      : Date.now() + 55 * 60 * 1000;
+    tokenState = { accessToken: bestToken, expiresAt };
+    const minsLeft = Math.round((expiresAt - Date.now()) / 60000);
+    console.log(`✅ Manager-scoped token stored. Valid for ~${minsLeft} min.`);
+    return bestToken;
   } finally {
     await browser.close();
   }
@@ -114,10 +153,6 @@ async function createBlock(booking) {
         signal: controller.signal,
       });
       console.log(`📡 Headers received. Status: ${r.status}`);
-      console.log(`📡 Response headers: ${JSON.stringify(Object.fromEntries(r.headers))}`);
-
-      // fetch's AbortController doesn't cover body reads — give res.text() its own timeout
-      // so a Cloudflare challenge / chunked stream that never closes can't hang us forever.
       const bodyText = await Promise.race([
         r.text(),
         new Promise((_, rej) => setTimeout(() => rej(new Error('body read timeout after 10s')), 10000)),
@@ -135,8 +170,8 @@ async function createBlock(booking) {
   const res   = await doRequest(token);
   console.log(`📡 Response ${res.status}: ${res.text.substring(0, 500)}`);
 
-  if (res.status === 401) {
-    console.log('🔄 401 — re-authenticating...');
+  if (res.status === 401 || res.status === 403) {
+    console.log(`🔄 ${res.status} — re-authenticating...`);
     tokenState.accessToken = null;
     const fresh = await getAccessToken();
     const retry = await doRequest(fresh);
@@ -166,7 +201,6 @@ app.get('/ping', async (req, res) => {
 });
 
 // ── PING (POST) — tests whether Railway → Playtomic POSTs work at all ─────────
-// Expected: 400 or 401 (no auth, empty body). Anything else = blocked/challenged.
 app.get('/ping-post', async (req, res) => {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 10000);
@@ -195,6 +229,20 @@ app.get('/ping-post', async (req, res) => {
     clearTimeout(t);
     res.json({ reachable: false, error: e.name, message: e.message });
   }
+});
+
+// ── TOKEN INSPECT — see what scopes the current token has ────────────────────
+app.get('/token-info', async (req, res) => {
+  if (!tokenState.accessToken) return res.json({ hasToken: false });
+  const payload = decodeJwtPayload(tokenState.accessToken);
+  res.json({
+    hasToken: true,
+    minutesRemaining: Math.round((tokenState.expiresAt - Date.now()) / 60000),
+    sub: payload?.sub,
+    scopes: payload?.scopes,
+    username: payload?.username,
+    exp: payload?.exp ? new Date(payload.exp * 1000).toISOString() : null,
+  });
 });
 
 app.get('/', (req, res) => res.json({
