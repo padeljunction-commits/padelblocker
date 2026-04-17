@@ -27,7 +27,7 @@ const CONFIG = {
   CHROMIUM_PATH:       process.env.CHROMIUM_PATH || null,
 };
 
-// Cached Bearer token — populated from page.on('request') on first UI run
+// Cached Bearer token — populated from localStorage on first UI run
 let cachedAuthToken = null;
 
 // ── HEALTH ────────────────────────────────────────────────────────────────────
@@ -82,9 +82,9 @@ async function blockViaAPI(booking) {
   // Format: "2026-04-05T21:00:00" (no Z, no milliseconds) — verified from working API response
   const payload = {
     tenant_id:    CONFIG.PLAYTOMIC_TENANT_ID,
-    resource_ids: [resourceId],          // array, not singular
-    name:         `CatchCorner – ${booking.customer || 'Booking'}`,  // "name" not "title"
-    start:        toLocalISOString(start),  // "2026-04-05T21:00:00"
+    resource_ids: [resourceId],
+    name:         `CatchCorner – ${booking.customer || 'Booking'}`,
+    start:        toLocalISOString(start),
     end:          toLocalISOString(end),
   };
 
@@ -220,6 +220,9 @@ async function blockViaBrowser(booking) {
       t.click();
     }, startDisp);
     await page.waitForTimeout(400);
+    // FIX: click Title field to force dropdown to fully close before proceeding
+    await page.getByPlaceholder('E.g.: Maintenance').click();
+    await page.waitForTimeout(300);
     console.log(`⏰ Start: ${startDisp}`);
 
     // END TIME — open, filter, click
@@ -246,11 +249,22 @@ async function blockViaBrowser(booking) {
       t.click();
     }, endDisp);
     await page.waitForTimeout(400);
+    // FIX: click Title field to force dropdown to fully close before proceeding
+    await page.getByPlaceholder('E.g.: Maintenance').click();
+    await page.waitForTimeout(300);
     console.log(`⏰ End: ${endDisp}`);
 
     // SUBMIT
+    // FIX: press Escape to dismiss any lingering dropdown backdrop overlay,
+    // then wait for the close animation to fully complete before clicking Create.
+    // In headless Playwright on Railway, the backdrop's z-index stays elevated
+    // mid-animation and intercepts pointer events — this clears it reliably.
     await takeScreenshot(page, booking.id, 'before-submit');
-    await page.getByRole('button', { name: 'Create' }).click();
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(500);
+    // FIX: use { force: true } to bypass Playwright's pointer-interception check
+    // as a final safety net, in case any residual overlay is still present.
+    await page.getByRole('button', { name: 'Create' }).click({ force: true });
     await page.waitForTimeout(3000);
     await takeScreenshot(page, booking.id, 'after-submit');
 
@@ -275,7 +289,6 @@ function pad(n) { return String(n).padStart(2, '0'); }
 
 // Extract local {h, m} in club timezone from a UTC Date
 function localHM(d) {
-  // "14:00" style from en-CA 24h
   const s = d.toLocaleTimeString('en-CA', { timeZone: CLUB_TZ, hour12: false, hour: '2-digit', minute: '2-digit' });
   const [h, m] = s.split(':').map(Number);
   return { h, m };
