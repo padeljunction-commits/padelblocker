@@ -10,13 +10,21 @@
  * On first blocking: drives browser UI, captures auth token from localStorage
  * On subsequent blockings: calls Playtomic API directly (no browser needed)
  *
- * FIX (Apr 2026): Playtomic wrapped the blocking form in a Modal component that
- * adds a permanent backdrop (position:fixed; inset:0; pointer-events:auto).
- * Playwright headless incorrectly flags this backdrop as intercepting all
- * .click() actions inside the form. Fix: replace every page.click() inside
- * the form with page.evaluate(() => element.click()), which calls the DOM
- * method directly and bypasses Playwright's actionability/hit-test check.
- * Verified working: 3/3 test blocks created successfully on Apr 17 2026.
+ * FIX 1 (Apr 2026) — Backdrop / Create button:
+ *   Playtomic wrapped the form in a Modal with a permanent backdrop
+ *   (position:fixed; inset:0; pointer-events:auto). Playwright headless flags
+ *   this as intercepting all .click() actions. Fix: use element.click() via
+ *   page.evaluate() for every click inside the form, bypassing the check.
+ *
+ * FIX 2 (Apr 2026) — Date field:
+ *   The date field is React-controlled and ignores nativeSetter + synthetic
+ *   events. The URL ?date= param also does not pre-fill it. The only reliable
+ *   approach: click the field to open the calendar picker, navigate to the
+ *   correct month, then click the day button (identified by aria-label = the
+ *   day number, which distinguishes current-month days from adjacent-month
+ *   overflow days whose aria-labels are "Mon DD").
+ *   page.locator('#input-startDate').click() is safe at this step because it
+ *   runs BEFORE the time dropdowns trigger the backdrop state change.
  */
 
 require('dotenv').config();
@@ -86,8 +94,6 @@ async function blockViaAPI(booking) {
     ? '1f900b5d-f99d-4b17-9a8a-1ceb28be5299'
     : '6ea04658-e7db-456a-beef-efc9c91fa7b0';
 
-  // Playtomic expects local datetime strings WITHOUT timezone offset
-  // Format: "2026-04-05T21:00:00" (no Z, no milliseconds) — verified from working API response
   const payload = {
     tenant_id:    CONFIG.PLAYTOMIC_TENANT_ID,
     resource_ids: [resourceId],
@@ -124,7 +130,7 @@ async function blockViaBrowser(booking) {
   const page    = await context.newPage();
 
   try {
-    // LOGIN
+    // ── LOGIN ────────────────────────────────────────────────────────────────
     console.log('🔐 Logging in...');
     await page.goto('https://manager.playtomic.io/auth/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.getByRole('textbox', { name: 'Email' }).waitFor({ timeout: 15000 });
@@ -135,9 +141,7 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(2000);
     console.log('✅ Logged in.');
 
-    // Read the ROLE_TENANT_MANAGER token directly from localStorage.
-    // Playtomic stores it at: accessTokens.tenant[TENANT_ID].value
-    // This is distinct from accessTokens.customer which only has ROLE_CUSTOMER scope.
+    // Read ROLE_TENANT_MANAGER token from localStorage
     const token = await page.evaluate((tenantId) => {
       const auth = JSON.parse(localStorage.getItem('playtomic:auth') || '{}');
       return auth?.accessTokens?.tenant?.[tenantId]?.value || null;
@@ -147,7 +151,7 @@ async function blockViaBrowser(booking) {
       cachedAuthToken = token;
       console.log('🔑 ROLE_TENANT_MANAGER token read from localStorage.');
     } else {
-      throw new Error('Tenant token not found in localStorage after login — cannot proceed.');
+      throw new Error('Tenant token not found in localStorage after login.');
     }
 
     const start     = new Date(booking.startTime);
@@ -158,18 +162,19 @@ async function blockViaBrowser(booking) {
     const endDisp   = toDisplayTime(end);
     const startType = toTypeStr(start);
     const endType   = toTypeStr(end);
-    const dateStr   = toDateStr(start);
+    const dateStr   = toDateStr(start);                          // "2026-04-25"
+    const [tYear, tMonth, tDay] = dateStr.split('-').map(Number); // [2026, 4, 25]
 
-    // OPEN FORM — pass date in URL to pre-fill the date field
+    // ── OPEN FORM ────────────────────────────────────────────────────────────
     await page.goto(
-      `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}&date=${dateStr}`,
+      `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`,
       { waitUntil: 'domcontentloaded', timeout: 60000 }
     );
     await page.locator('#input-resource').waitFor({ timeout: 15000 });
     await page.waitForTimeout(500);
     console.log('📝 Form loaded.');
 
-    // TITLE — use nativeSetter via evaluate (avoids any page.click() inside the modal)
+    // ── TITLE — nativeSetter (no click needed) ────────────────────────────────
     await page.evaluate((title) => {
       const inp = document.getElementById('input-name');
       if (!inp) throw new Error('#input-name not found');
@@ -178,23 +183,71 @@ async function blockViaBrowser(booking) {
       inp.dispatchEvent(new Event('input', { bubbles: true }));
     }, `CatchCorner – ${booking.customer || 'Booking'}`);
 
-    // DATE — URL param pre-fills it; if not, set via evaluate (no page.click() needed)
-    const dateActual = await page.locator('#input-startDate').inputValue();
-    if (dateActual !== dateStr) {
-      console.log(`📆 URL param did not pre-fill date ("${dateActual}") — setting via evaluate`);
-      await page.evaluate((d) => {
-        const inp = document.getElementById('input-startDate');
-        if (!inp) throw new Error('#input-startDate not found');
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(inp, d);
-        inp.dispatchEvent(new Event('input',  { bubbles: true }));
-        inp.dispatchEvent(new Event('change', { bubbles: true }));
-      }, dateStr);
+    // ── DATE — calendar picker approach ──────────────────────────────────────
+    // The date field is React-controlled and ignores nativeSetter + synthetic
+    // events. The URL ?date= param also doesn't pre-fill it. Only real
+    // interaction with the calendar picker works.
+    //
+    // page.locator().click() is SAFE here — it runs before the time dropdowns
+    // trigger the React re-render that locks the backdrop into blocking state.
+    await page.locator('#input-startDate').click();
+    await page.waitForTimeout(400); // calendar opens
+
+    const MONTH_NAMES = ['January','February','March','April','May','June',
+                         'July','August','September','October','November','December'];
+
+    // Navigate calendar to the correct month/year (max 24 steps = 2 years)
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const { curMonth, curYear } = await page.evaluate((months) => {
+        const all = Array.from(document.querySelectorAll('*'))
+          .filter(el => el.offsetParent && el.children.length === 0);
+        const mEl = all.find(el => months.includes(el.textContent.trim()));
+        const yEl = all.find(el => /^\d{4}$/.test(el.textContent.trim()));
+        return {
+          curMonth: mEl ? months.indexOf(mEl.textContent.trim()) + 1 : null,
+          curYear:  yEl ? parseInt(yEl.textContent.trim()) : null,
+        };
+      }, MONTH_NAMES);
+
+      if (curMonth === tMonth && curYear === tYear) break;
+
+      const diff = (tYear - curYear) * 12 + (tMonth - curMonth);
+      // Click prev (<) or next (>) nav button via evaluate
+      await page.evaluate((goNext) => {
+        const MONTHS = ['January','February','March','April','May','June',
+                        'July','August','September','October','November','December'];
+        const all = Array.from(document.querySelectorAll('*'))
+          .filter(el => el.offsetParent && el.children.length === 0);
+        const mEl = all.find(el => MONTHS.includes(el.textContent.trim()));
+        if (!mEl) throw new Error('Calendar month element not found');
+        // Walk up until we find the header container with exactly 2 nav buttons
+        let container = mEl.parentElement;
+        for (let i = 0; i < 5; i++) {
+          const btns = Array.from(container.querySelectorAll('button')).filter(b => b.offsetParent);
+          if (btns.length >= 2) {
+            (goNext ? btns[btns.length - 1] : btns[0]).click();
+            return;
+          }
+          container = container.parentElement;
+        }
+        throw new Error('Calendar nav buttons not found');
+      }, diff > 0);
       await page.waitForTimeout(300);
     }
+
+    // Click the target day.
+    // Current-month days have aria-label = just the number ("25").
+    // Adjacent-month overflow days have aria-label = "Mon DD" ("Apr 25") — excluded.
+    await page.evaluate((day) => {
+      const btn = Array.from(document.querySelectorAll('button'))
+        .find(b => b.offsetParent && b.getAttribute('aria-label') === String(day));
+      if (!btn) throw new Error(`Calendar day ${day} not found`);
+      btn.click();
+    }, tDay);
+    await page.waitForTimeout(300);
     console.log(`📆 Date: ${dateStr}`);
 
-    // COURT — open with focus+Space, click option by name
+    // ── COURT ─────────────────────────────────────────────────────────────────
     await page.evaluate((name) => {
       const inp = document.getElementById('input-resource');
       if (!inp) throw new Error('#input-resource not found');
@@ -213,7 +266,7 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(400);
     console.log(`🏓 Court: ${courtName}`);
 
-    // START TIME — open, filter, click
+    // ── START TIME ────────────────────────────────────────────────────────────
     await page.evaluate(() => {
       const inp = document.getElementById('input-startTime');
       if (!inp) throw new Error('#input-startTime not found');
@@ -239,7 +292,7 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(400);
     console.log(`⏰ Start: ${startDisp}`);
 
-    // END TIME — open, filter, click
+    // ── END TIME ──────────────────────────────────────────────────────────────
     await page.evaluate(() => {
       const inp = document.getElementById('input-endTime');
       if (!inp) throw new Error('#input-endTime not found');
@@ -265,12 +318,9 @@ async function blockViaBrowser(booking) {
     await page.waitForTimeout(400);
     console.log(`⏰ End: ${endDisp}`);
 
-    // SUBMIT
-    // FIX: use element.click() via evaluate() instead of page.getByRole().click().
-    // Playtomic now wraps the form in a Modal with a permanent backdrop
-    // (position:fixed; inset:0; pointer-events:auto). Playwright headless flags
-    // this backdrop as intercepting all .click() actions inside the form.
-    // element.click() calls the DOM method directly, bypassing that check entirely.
+    // ── SUBMIT ────────────────────────────────────────────────────────────────
+    // FIX: element.click() via evaluate bypasses Playwright's actionability
+    // hit-test which incorrectly flags the Modal backdrop as intercepting.
     await takeScreenshot(page, booking.id, 'before-submit');
     await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button'))
@@ -292,41 +342,29 @@ async function blockViaBrowser(booking) {
 }
 
 // ── TIME HELPERS ──────────────────────────────────────────────────────────────
-// All UI times must be in club local time (America/Toronto).
-// The Playtomic Manager form shows and accepts local time only.
-// Webhook startTime/endTime arrive as UTC ISO strings — convert before use.
-
 const CLUB_TZ = 'America/Toronto';
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
-// Extract local {h, m} in club timezone from a UTC Date
 function localHM(d) {
   const s = d.toLocaleTimeString('en-CA', { timeZone: CLUB_TZ, hour12: false, hour: '2-digit', minute: '2-digit' });
   const [h, m] = s.split(':').map(Number);
   return { h, m };
 }
 
-// "2026-03-19" in club local timezone
+// "2026-04-25" — YYYY-MM-DD in Toronto timezone (en-CA locale)
 function toDateStr(d) {
-  return d.toLocaleDateString('en-CA', { timeZone: CLUB_TZ }); // en-CA → YYYY-MM-DD
+  return d.toLocaleDateString('en-CA', { timeZone: CLUB_TZ });
 }
 
-// "18:00" in club local timezone — for direct API calls
-function toTimeStr(d) {
-  const { h, m } = localHM(d);
-  return `${pad(h)}:${pad(m)}`;
-}
-
-// "2026-04-05T21:00:00" — local datetime WITHOUT timezone offset
-// Verified from working Playtomic API response — no Z, no milliseconds
+// "2026-04-05T21:00:00" — local datetime, no Z, no ms (Playtomic API format)
 function toLocalISOString(d) {
   const date = d.toLocaleDateString('en-CA', { timeZone: CLUB_TZ });
   const { h, m } = localHM(d);
   return `${date}T${pad(h)}:${pad(m)}:00`;
 }
 
-// "6:00" — typed into filter box (no leading zero, 12h, local time)
+// "6:00" — filter box input (no leading zero, 12h)
 function toTypeStr(d) {
   let { h, m } = localHM(d);
   if (h > 12) h -= 12;
@@ -334,8 +372,7 @@ function toTypeStr(d) {
   return `${h}:${pad(m)}`;
 }
 
-// "06:00 p.m." — exact dropdown option text (local time)
-// norm() in pickOption handles both "p.m." and "PM" formats across browsers
+// "06:00 p.m." — exact dropdown option text
 function toDisplayTime(d) {
   let { h, m } = localHM(d);
   const mer = h >= 12 ? 'p.m.' : 'a.m.';
