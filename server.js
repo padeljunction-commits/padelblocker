@@ -25,6 +25,17 @@
  *   overflow days whose aria-labels are "Mon DD").
  *   page.locator('#input-startDate').click() is safe at this step because it
  *   runs BEFORE the time dropdowns trigger the backdrop state change.
+ *
+ * FIX 3 (Apr 2026) — Timezone on API payload:
+ *   The Playtomic API (POST /availability/availability_blocks) interprets a
+ *   bare ISO datetime (e.g. "2026-04-23T12:00:00") as UTC, NOT as local time.
+ *   Earlier notes claimed "local Toronto time, no Z" worked — that was wrong
+ *   (or only coincidentally worked in winter / around specific offsets).
+ *   Verified empirically on 2026-04-22: sending "2026-04-23T00:00:00Z"
+ *   rendered at 8:00 PM EDT on Apr 22, which is correct UTC parsing.
+ *   Fix: send start/end as true UTC with a "Z" suffix, not local clock time.
+ *   Browser-form path still uses local time (toDisplayTime / toTypeStr) because
+ *   the Playtomic UI dropdowns show local times.
  */
 
 require('dotenv').config();
@@ -94,12 +105,13 @@ async function blockViaAPI(booking) {
     ? '1f900b5d-f99d-4b17-9a8a-1ceb28be5299'
     : '6ea04658-e7db-456a-beef-efc9c91fa7b0';
 
+  // FIX 3: Playtomic API expects UTC with Z suffix, not local clock time.
   const payload = {
     tenant_id:    CONFIG.PLAYTOMIC_TENANT_ID,
     resource_ids: [resourceId],
     name:         `CatchCorner – ${booking.customer || 'Booking'}`,
-    start:        toLocalISOString(start),
-    end:          toLocalISOString(end),
+    start:        toUTCISOString(start),
+    end:          toUTCISOString(end),
   };
 
   console.log(`📡 Block payload: ${JSON.stringify(payload)}`);
@@ -352,19 +364,23 @@ function localHM(d) {
   return { h, m };
 }
 
-// "2026-04-25" — YYYY-MM-DD in Toronto timezone (en-CA locale)
+// "2026-04-25" — YYYY-MM-DD in Toronto timezone (en-CA locale). Used by the
+// browser form-fill path only — the Playtomic UI calendar picker expects the
+// date in local time.
 function toDateStr(d) {
   return d.toLocaleDateString('en-CA', { timeZone: CLUB_TZ });
 }
 
-// "2026-04-05T21:00:00" — local datetime, no Z, no ms (Playtomic API format)
-function toLocalISOString(d) {
-  const date = d.toLocaleDateString('en-CA', { timeZone: CLUB_TZ });
-  const { h, m } = localHM(d);
-  return `${date}T${pad(h)}:${pad(m)}:00`;
+// "2026-04-23T00:00:00Z" — true UTC with Z suffix, no milliseconds.
+// This is the format the Playtomic availability_blocks API expects.
+// Earlier notes said "local time, no Z" but that was wrong — the API
+// interprets a bare datetime as UTC, which shifted all blocks by the
+// Toronto offset (-4h EDT / -5h EST).
+function toUTCISOString(d) {
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
-// "6:00" — filter box input (no leading zero, 12h)
+// "6:00" — filter box input (no leading zero, 12h). Browser path only.
 function toTypeStr(d) {
   let { h, m } = localHM(d);
   if (h > 12) h -= 12;
@@ -372,7 +388,7 @@ function toTypeStr(d) {
   return `${h}:${pad(m)}`;
 }
 
-// "06:00 p.m." — exact dropdown option text
+// "06:00 p.m." — exact dropdown option text. Browser path only.
 function toDisplayTime(d) {
   let { h, m } = localHM(d);
   const mer = h >= 12 ? 'p.m.' : 'a.m.';
