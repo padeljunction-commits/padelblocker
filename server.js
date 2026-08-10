@@ -498,12 +498,43 @@ async function selectDate(page, year, month, day) {
     await delay(150);
   }
 
-  await page.evaluate((targetDay) => {
-    const button = Array.from(document.querySelectorAll('button'))
-      .find(el => el.offsetParent && el.getAttribute('aria-label') === String(targetDay));
-    if (!button) throw new Error(`Calendar day ${targetDay} not found`);
+  await page.evaluate(({ year, month, day, monthName }) => {
+    const visibleButtons = Array.from(document.querySelectorAll('button'))
+      .filter(button => button.offsetParent && !button.disabled);
+    const normalized = value => String(value || '').toLowerCase().replace(/[,.-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const fullDateTokens = [String(year), monthName.toLowerCase(), String(day)];
+
+    // Playtomic has used several calendar implementations. Prefer a button
+    // whose accessible date contains the full target date, then fall back to
+    // the visible day number after the picker has been moved to the right month.
+    let button = visibleButtons.find(candidate => {
+      const metadata = normalized([
+        candidate.getAttribute('aria-label'),
+        candidate.getAttribute('title'),
+        candidate.getAttribute('data-date'),
+        candidate.getAttribute('datetime'),
+      ].join(' '));
+      return fullDateTokens.every(token => metadata.includes(token));
+    });
+
+    if (!button) {
+      const dayCandidates = visibleButtons.filter(candidate => candidate.textContent.trim() === String(day));
+      button = dayCandidates.find(candidate => {
+        const classes = normalized(candidate.className);
+        return !classes.includes('outside') && !classes.includes('neighbor') && !classes.includes('overflow');
+      }) || dayCandidates[0];
+    }
+
+    if (!button) {
+      const sample = visibleButtons
+        .map(candidate => `${candidate.textContent.trim()}[${candidate.getAttribute('aria-label') || ''}]`)
+        .filter(Boolean)
+        .slice(0, 80)
+        .join('|');
+      throw new Error(`Calendar date ${year}-${month}-${day} not found; buttons=${sample}`);
+    }
     button.click();
-  }, day);
+  }, { year, month, day, monthName: months[month - 1] });
 }
 
 async function selectDropdown(page, inputId, filterText, optionText) {
