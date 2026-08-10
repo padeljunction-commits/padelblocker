@@ -487,13 +487,19 @@ async function selectDate(page, year, month, day) {
       const monthEl = leaves.find(el => months.includes(el.textContent.trim()));
       let container = monthEl?.parentElement;
       for (let depth = 0; depth < 6 && container; depth += 1, container = container.parentElement) {
-        const buttons = Array.from(container.querySelectorAll('button')).filter(button => button.offsetParent);
-        if (buttons.length >= 2) {
-          (goNext ? buttons[buttons.length - 1] : buttons[0]).click();
+        const wanted = goNext ? 'next' : 'previous';
+        const buttons = Array.from(container.querySelectorAll('button')).filter(button => {
+          if (!button.offsetParent || button.disabled) return false;
+          const label = String(button.getAttribute('aria-label') || button.getAttribute('title') || '')
+            .trim().toLowerCase();
+          return label === wanted || label.startsWith(`${wanted} `);
+        });
+        if (buttons.length === 1) {
+          buttons[0].click();
           return;
         }
       }
-      throw new Error('Calendar navigation buttons not found');
+      throw new Error(`Calendar ${goNext ? 'Next' : 'Previous'} button not found near ${monthEl?.textContent || 'month'}`);
     }, { goNext, months });
     await delay(150);
   }
