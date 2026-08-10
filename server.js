@@ -426,10 +426,19 @@ async function blockViaBrowser(booking) {
     );
 
     await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const create = buttons.find(button => button.textContent.trim() === 'Create' && !button.disabled);
-      if (!create) throw new Error('Enabled Create button not found');
-      create.click();
+      const resourceInput = document.getElementById('input-resource');
+      if (!resourceInput) throw new Error('#input-resource missing at submit');
+      let container = resourceInput.parentElement;
+      for (let depth = 0; depth < 10 && container; depth += 1, container = container.parentElement) {
+        const buttons = Array.from(container.querySelectorAll('button')).filter(button =>
+          button.offsetParent && button.textContent.trim() === 'Create' && !button.disabled,
+        );
+        if (buttons.length === 1) {
+          buttons[0].click();
+          return;
+        }
+      }
+      throw new Error('Form-scoped enabled Create button not found');
     });
 
     const response = await responsePromise;
