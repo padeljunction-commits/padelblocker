@@ -1,0 +1,4 @@
+node_modules/
+.env
+jobs.json
+jobs.json.tmp
