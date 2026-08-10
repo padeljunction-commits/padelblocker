@@ -395,17 +395,21 @@ async function blockViaBrowser(booking) {
 
     const formUrl = `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
     await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    if (page.url().includes('/auth/login')) {
+    const entryState = await Promise.race([
+      page.locator('#input-resource').waitFor({ state: 'visible', timeout: 25_000 }).then(() => 'form'),
+      page.getByRole('textbox', { name: 'Email' }).waitFor({ state: 'visible', timeout: 25_000 }).then(() => 'login'),
+    ]);
+    if (entryState === 'login') {
       console.log('UI persistent session requires login');
       await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
       await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
       await page.getByRole('button', { name: 'Log In' }).click();
       await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 45_000 });
       await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await page.locator('#input-resource').waitFor({ state: 'visible', timeout: 25_000 });
     } else {
       console.log('UI reusing persistent Playtomic session');
     }
-    await page.locator('#input-resource').waitFor({ timeout: 20_000 });
 
     await setReactInput(page, 'input-name', `CatchCorner - ${booking.customer || 'Booking'}`);
     await selectDate(page, targetYear, targetMonth, targetDay);
