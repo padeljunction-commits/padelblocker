@@ -29,6 +29,7 @@ const RESOURCE_IDS = {
 
 let cachedWriteToken = null;
 let cachedWriteTokenExpiresAt = 0;
+let persistentContextPromise = null;
 let store = { version: 1, jobs: {} };
 let storeWrite = Promise.resolve();
 let workerStarted = false;
@@ -382,36 +383,28 @@ function extractBlockId(result) {
 }
 
 async function blockViaBrowser(booking) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    ...(CONFIG.CHROMIUM_PATH ? { executablePath: CONFIG.CHROMIUM_PATH } : {}),
-  });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 900 },
-    locale: 'en-CA',
-    timezoneId: CLUB_TZ,
-  });
+  const context = await getPersistentContext();
   const page = await context.newPage();
 
   try {
-    console.log('UI logging in');
-    await page.goto('https://manager.playtomic.io/auth/login', { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
-    await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
-    await page.getByRole('button', { name: 'Log In' }).click();
-    await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 45_000 });
-
     const start = new Date(booking.startTime);
     const end = new Date(booking.endTime);
     const courtNum = booking.court.match(/\d+/)?.[0];
     const dateStr = toDateStr(start);
     const [targetYear, targetMonth, targetDay] = dateStr.split('-').map(Number);
 
-    await page.goto(
-      `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`,
-      { waitUntil: 'domcontentloaded', timeout: 60_000 },
-    );
+    const formUrl = `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
+    await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    if (page.url().includes('/auth/login')) {
+      console.log('UI persistent session requires login');
+      await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
+      await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
+      await page.getByRole('button', { name: 'Log In' }).click();
+      await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 45_000 });
+      await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    } else {
+      console.log('UI reusing persistent Playtomic session');
+    }
     await page.locator('#input-resource').waitFor({ timeout: 20_000 });
 
     await setReactInput(page, 'input-name', `CatchCorner - ${booking.customer || 'Booking'}`);
@@ -452,8 +445,26 @@ async function blockViaBrowser(booking) {
     console.error(`UI failure url=${page.url()} error=${err.message}`);
     throw err;
   } finally {
-    await browser.close();
+    await page.close();
   }
+}
+
+async function getPersistentContext() {
+  if (!persistentContextPromise) {
+    const profilePath = path.join(path.dirname(CONFIG.JOB_STORE_PATH), 'playtomic-profile');
+    persistentContextPromise = chromium.launchPersistentContext(profilePath, {
+      headless: true,
+      viewport: { width: 1280, height: 900 },
+      locale: 'en-CA',
+      timezoneId: CLUB_TZ,
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      ...(CONFIG.CHROMIUM_PATH ? { executablePath: CONFIG.CHROMIUM_PATH } : {}),
+    }).catch(err => {
+      persistentContextPromise = null;
+      throw err;
+    });
+  }
+  return persistentContextPromise;
 }
 
 async function readPlaywrightResponse(response) {
