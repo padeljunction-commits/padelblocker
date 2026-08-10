@@ -134,6 +134,7 @@ function publicJob(job) {
     nextAttemptAt: job.nextAttemptAt,
     lastError: job.lastError,
     blockId: job.blockId,
+    deletedAt: job.deletedAt || null,
     booking: job.booking,
   };
 }
@@ -149,6 +150,7 @@ app.get('/', (req, res) => {
       queued: jobs.filter(j => j.status === 'queued').length,
       processing: jobs.filter(j => j.status === 'processing').length,
       succeeded: jobs.filter(j => j.status === 'succeeded').length,
+      deleted: jobs.filter(j => j.status === 'deleted').length,
       failed: jobs.filter(j => j.status === 'failed').length,
     },
   });
@@ -195,8 +197,24 @@ app.post('/admin/jobs/:id/retry', requireSecret, async (req, res) => {
 
 app.post('/admin/blocks/:id/delete', requireSecret, async (req, res) => {
   try {
-    const result = await deleteBlockViaAPI(req.params.id);
-    res.json({ status: 'deleted', blockId: req.params.id, result });
+    let result = null;
+    let alreadyDeleted = false;
+    try {
+      result = await deleteBlockViaAPI(req.params.id);
+    } catch (err) {
+      if (/API 404:.*CLOSED_DATE_NOT_FOUND/.test(err.message)) alreadyDeleted = true;
+      else throw err;
+    }
+
+    for (const job of Object.values(store.jobs)) {
+      if (job.blockId === req.params.id) {
+        job.status = 'deleted';
+        job.deletedAt = new Date().toISOString();
+        job.updatedAt = job.deletedAt;
+      }
+    }
+    await saveStore();
+    res.json({ status: 'deleted', alreadyDeleted, blockId: req.params.id, result });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
