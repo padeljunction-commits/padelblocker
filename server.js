@@ -405,6 +405,10 @@ async function blockViaBrowser(booking) {
       await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
       await page.getByRole('button', { name: 'Log In' }).click();
       await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 45_000 });
+      // Playtomic writes the tenant session shortly after the route changes.
+      // Reopening the form immediately can race that initialization and render
+      // an empty form shell with no resource selector.
+      await page.waitForTimeout(3000);
       await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       await page.locator('#input-resource').waitFor({ state: 'visible', timeout: 25_000 });
     } else {
