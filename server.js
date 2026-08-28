@@ -141,6 +141,19 @@ function publicJob(job) {
   };
 }
 
+function blockMatchesBooking(booking, block) {
+  if (!booking || !block) return false;
+  const courtNum = String(booking.court || '').match(/\d+/)?.[0];
+  const expectedResource = RESOURCE_IDS[courtNum];
+  const actualResources = Array.isArray(block.resource_ids) ? block.resource_ids : [];
+  const expectedStart = new Date(booking.startTime).toISOString().slice(0, 19);
+  const expectedEnd = new Date(booking.endTime).toISOString().slice(0, 19);
+  const actualStart = String(block.start || '').replace(/Z$/, '').slice(0, 19);
+  const actualEnd = String(block.end || '').replace(/Z$/, '').slice(0, 19);
+  return Boolean(expectedResource) && actualResources.includes(expectedResource) &&
+    actualStart === expectedStart && actualEnd === expectedEnd;
+}
+
 function calendarWatcherHealth(now = Date.now(), health = store.health) {
   const lastHeartbeatAt = health?.lastCalendarHeartbeatAt || null;
   const heartbeatMs = lastHeartbeatAt ? new Date(lastHeartbeatAt).getTime() : NaN;
@@ -210,6 +223,45 @@ app.get('/admin/jobs/:id', requireSecret, (req, res) => {
   const job = store.jobs[req.params.id];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(publicJob(job));
+});
+
+app.get('/admin/mismatches', requireSecret, (req, res) => {
+  const mismatches = Object.values(store.jobs)
+    .filter(job => job.status === 'succeeded' && job.blockId && !blockMatchesBooking(job.booking, job.result))
+    .map(publicJob);
+  res.json({ mismatches });
+});
+
+app.post('/admin/reconcile-mismatches', requireSecret, async (req, res) => {
+  const futureOnly = req.body?.futureOnly !== false;
+  const now = Date.now();
+  const candidates = Object.values(store.jobs).filter(job =>
+    job.status === 'succeeded' && job.blockId &&
+    (!futureOnly || new Date(job.booking.endTime).getTime() > now) &&
+    !blockMatchesBooking(job.booking, job.result)
+  );
+  const queued = [];
+  const failures = [];
+
+  for (const job of candidates) {
+    const wrongBlockId = job.blockId;
+    try {
+      await deleteBlockViaAPI(wrongBlockId);
+      job.status = 'queued';
+      job.attempts = 0;
+      job.blockId = null;
+      job.result = null;
+      job.lastError = `Requeued after deleting mismatched block ${wrongBlockId}`;
+      job.nextAttemptAt = new Date().toISOString();
+      job.updatedAt = job.nextAttemptAt;
+      job.repairedBlockIds = [...(job.repairedBlockIds || []), wrongBlockId];
+      queued.push(job.id);
+    } catch (err) {
+      failures.push({ jobId: job.id, blockId: wrongBlockId, error: String(err.message || err).slice(0, 500) });
+    }
+  }
+  await saveStore();
+  res.json({ futureOnly, candidates: candidates.length, queued, failures });
 });
 
 app.post('/admin/jobs/:id/retry', requireSecret, async (req, res) => {
@@ -307,14 +359,39 @@ async function processJob(job) {
 async function createBlockReliable(booking) {
   if (hasUsableWriteToken()) {
     try {
-      return await blockViaAPI(booking);
+      return await createAndVerifyBlock(booking, blockViaAPI);
     } catch (err) {
       if (!isAuthFailure(err)) throw err;
       console.warn('AUTH cached write token rejected; falling back to Playtomic UI');
       clearWriteToken();
     }
   }
-  return blockViaBrowser(booking);
+  return createAndVerifyBlock(booking, blockViaBrowser);
+}
+
+async function createAndVerifyBlock(booking, createFn) {
+  const result = await createFn(booking);
+  const blockId = extractBlockId(result);
+  if (!blockId) throw new Error('Post-write verification failed: Playtomic returned no block id');
+
+  try {
+    const persisted = await getBlockViaAPI(blockId);
+    if (!blockMatchesBooking(booking, persisted)) {
+      throw new Error(
+        `expected ${booking.court} ${booking.startTime} - ${booking.endTime}, ` +
+        `stored ${JSON.stringify(persisted.resource_ids || [])} ${persisted.start || 'unknown'} - ${persisted.end || 'unknown'}`
+      );
+    }
+    return result;
+  } catch (err) {
+    try {
+      await deleteBlockViaAPI(blockId);
+      console.error(`VERIFY removed mismatched/unverified block=${blockId}`);
+    } catch (cleanupErr) {
+      console.error(`VERIFY cleanup failed block=${blockId} error=${cleanupErr.message}`);
+    }
+    throw new Error(`Post-write verification failed: ${err.message}`);
+  }
 }
 
 function isAuthFailure(err) {
@@ -699,6 +776,7 @@ if (require.main === module) {
 module.exports = {
   app,
   blockPayload,
+  blockMatchesBooking,
   calendarWatcherHealth,
   extractBlockId,
   jobIdFor,

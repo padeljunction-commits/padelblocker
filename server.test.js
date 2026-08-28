@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   blockPayload,
+  blockMatchesBooking,
   calendarWatcherHealth,
   extractBlockId,
   jobIdFor,
@@ -68,4 +69,14 @@ test('calendar watcher health distinguishes missing, fresh, and stale heartbeats
   });
   assert.equal(stale.status, 'stale');
   assert.equal(stale.ageMinutes, 30);
+});
+
+test('post-write verification rejects a previous-month Playtomic block', () => {
+  const expected = blockPayload(base);
+  assert.equal(blockMatchesBooking(base, expected), true);
+  assert.equal(blockMatchesBooking(base, {
+    ...expected,
+    start: '2026-08-15T21:15:00',
+    end: '2026-08-15T22:45:00',
+  }), false);
 });
