@@ -30,7 +30,7 @@ const RESOURCE_IDS = {
 let cachedWriteToken = null;
 let cachedWriteTokenExpiresAt = 0;
 let persistentContextPromise = null;
-let store = { version: 1, jobs: {} };
+let store = { version: 1, jobs: {}, health: {} };
 let storeWrite = Promise.resolve();
 let workerStarted = false;
 
@@ -67,7 +67,9 @@ async function loadStore() {
   await fs.mkdir(path.dirname(CONFIG.JOB_STORE_PATH), { recursive: true });
   try {
     const parsed = JSON.parse(await fs.readFile(CONFIG.JOB_STORE_PATH, 'utf8'));
-    if (parsed?.version === 1 && parsed.jobs && typeof parsed.jobs === 'object') store = parsed;
+    if (parsed?.version === 1 && parsed.jobs && typeof parsed.jobs === 'object') {
+      store = { ...parsed, health: parsed.health && typeof parsed.health === 'object' ? parsed.health : {} };
+    }
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
     await saveStore();
@@ -139,6 +141,20 @@ function publicJob(job) {
   };
 }
 
+function calendarWatcherHealth(now = Date.now(), health = store.health) {
+  const lastHeartbeatAt = health?.lastCalendarHeartbeatAt || null;
+  const heartbeatMs = lastHeartbeatAt ? new Date(lastHeartbeatAt).getTime() : NaN;
+  const ageMinutes = Number.isFinite(heartbeatMs) ? Math.max(0, (now - heartbeatMs) / 60_000) : null;
+  return {
+    status: ageMinutes == null ? 'missing' : ageMinutes > 20 ? 'stale' : 'ok',
+    lastHeartbeatAt,
+    ageMinutes: ageMinutes == null ? null : Math.round(ageMinutes * 10) / 10,
+    staleAfterMinutes: 20,
+    scannedEvents: Number(health?.scannedEvents || 0),
+    pendingEvents: Number(health?.pendingEvents || 0),
+  };
+}
+
 app.get('/', (req, res) => {
   const jobs = Object.values(store.jobs);
   res.json({
@@ -146,6 +162,7 @@ app.get('/', (req, res) => {
     service: 'Padel Junction Playtomic Blocker',
     durableQueue: true,
     hasWriteToken: hasUsableWriteToken(),
+    calendarWatcher: calendarWatcherHealth(),
     jobs: {
       queued: jobs.filter(j => j.status === 'queued').length,
       processing: jobs.filter(j => j.status === 'processing').length,
@@ -154,6 +171,17 @@ app.get('/', (req, res) => {
       failed: jobs.filter(j => j.status === 'failed').length,
     },
   });
+});
+
+app.post('/heartbeat', requireSecret, async (req, res) => {
+  const now = new Date().toISOString();
+  store.health = {
+    lastCalendarHeartbeatAt: now,
+    scannedEvents: Math.max(0, Number(req.body?.scannedEvents || 0)),
+    pendingEvents: Math.max(0, Number(req.body?.pendingEvents || 0)),
+  };
+  await saveStore();
+  res.json({ status: 'ok', lastHeartbeatAt: now });
 });
 
 app.post('/webhook/catchcorner', requireSecret, async (req, res) => {
@@ -671,6 +699,7 @@ if (require.main === module) {
 module.exports = {
   app,
   blockPayload,
+  calendarWatcherHealth,
   extractBlockId,
   jobIdFor,
   toDateStr,

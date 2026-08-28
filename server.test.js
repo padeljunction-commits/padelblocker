@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const {
   blockPayload,
+  calendarWatcherHealth,
   extractBlockId,
   jobIdFor,
   toDateStr,
@@ -52,4 +53,19 @@ test('extracts block ids from known response shapes', () => {
   assert.equal(extractBlockId({ availability_block_id: 'a' }), 'a');
   assert.equal(extractBlockId({ id: 'b' }), 'b');
   assert.equal(extractBlockId({ availability_block: { id: 'c' } }), 'c');
+});
+
+test('calendar watcher health distinguishes missing, fresh, and stale heartbeats', () => {
+  const now = Date.parse('2026-08-28T18:00:00.000Z');
+  assert.equal(calendarWatcherHealth(now, {}).status, 'missing');
+  assert.equal(calendarWatcherHealth(now, {
+    lastCalendarHeartbeatAt: '2026-08-28T17:45:00.000Z',
+    scannedEvents: 42,
+    pendingEvents: 1,
+  }).status, 'ok');
+  const stale = calendarWatcherHealth(now, {
+    lastCalendarHeartbeatAt: '2026-08-28T17:30:00.000Z',
+  });
+  assert.equal(stale.status, 'stale');
+  assert.equal(stale.ageMinutes, 30);
 });
