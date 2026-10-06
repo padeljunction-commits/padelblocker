@@ -544,12 +544,7 @@ async function blockViaBrowser(booking) {
     await selectDropdown(page, 'input-startTime', toTypeStr(start), toDisplayTime(start));
     await selectDropdown(page, 'input-endTime', toTypeStr(end), toDisplayTime(end));
 
-    const responsePromise = page.waitForResponse(
-      response => response.request().method() === 'POST' && response.url().includes('/availability/availability_blocks'),
-      { timeout: 30_000 },
-    );
-
-    await page.evaluate(() => {
+    const response = await submitBlockAndWait(page, () => page.evaluate(() => {
       const resourceInput = document.getElementById('input-resource');
       if (!resourceInput) throw new Error('#input-resource missing at submit');
       let container = resourceInput.parentElement;
@@ -563,9 +558,7 @@ async function blockViaBrowser(booking) {
         }
       }
       throw new Error('Form-scoped enabled Create button not found');
-    });
-
-    const response = await responsePromise;
+    }));
     const responseBody = await readPlaywrightResponse(response);
     if (!response.ok()) throw new Error(`UI create API ${response.status()}: ${stringifyBody(responseBody)}`);
 
@@ -578,6 +571,19 @@ async function blockViaBrowser(booking) {
   } finally {
     await page.close();
   }
+}
+
+async function submitBlockAndWait(page, submit) {
+  const responsePromise = page.waitForResponse(
+    response => response.request().method() === 'POST' && response.url().includes('/availability/availability_blocks'),
+    { timeout: 30_000 },
+  ).then(response => ({ response }), error => ({ error }));
+  // Attach rejection handling before submitting: a failed click closes the page
+  // before this listener is awaited, and must remain a retryable job failure.
+  await submit();
+  const outcome = await responsePromise;
+  if (outcome.error) throw outcome.error;
+  return outcome.response;
 }
 
 async function getPersistentContext() {
@@ -780,6 +786,7 @@ module.exports = {
   calendarWatcherHealth,
   extractBlockId,
   jobIdFor,
+  submitBlockAndWait,
   toDateStr,
   toDisplayTime,
   toTypeStr,

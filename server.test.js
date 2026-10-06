@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 
 const {
   blockPayload,
@@ -7,6 +8,7 @@ const {
   calendarWatcherHealth,
   extractBlockId,
   jobIdFor,
+  submitBlockAndWait,
   toDateStr,
   toDisplayTime,
   toTypeStr,
@@ -25,6 +27,44 @@ test('validates a complete booking', () => {
   assert.equal(validateBooking(base), null);
   assert.match(validateBooking({ ...base, court: 'Padel 9' }), /Unknown court/);
   assert.match(validateBooking({ ...base, endTime: base.startTime }), /Invalid booking time range/);
+});
+
+test('a failed submit followed by page close cannot crash the worker', () => {
+  const result = spawnSync(process.execPath, ['--unhandled-rejections=strict', '-e', `
+    const { submitBlockAndWait } = require('./server');
+    let rejectResponse;
+    const page = {waitForResponse: () => new Promise((_, reject) => {rejectResponse = reject})};
+    (async () => {
+      try {
+        await submitBlockAndWait(page, async () => {throw new Error('Create button not found')});
+        process.exitCode = 2;
+      } catch (error) {
+        if (error.message !== 'Create button not found') process.exitCode = 3;
+      } finally {
+        rejectResponse(new Error('Target page, context or browser has been closed'));
+      }
+      await new Promise(resolve => setImmediate(resolve));
+    })();
+  `], { cwd: __dirname, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('response failure during submission remains a handled job error', async () => {
+  let rejectResponse;
+  const page = { waitForResponse: () => new Promise((_, reject) => { rejectResponse = reject; }) };
+  await assert.rejects(submitBlockAndWait(page, async () => {
+    rejectResponse(new Error('response timeout'));
+    await new Promise(resolve => setImmediate(resolve));
+  }), /response timeout/);
+});
+
+test('successful submit returns its observed response', async () => {
+  const response = { id: 'persisted-response' };
+  let submitted = false;
+  assert.equal(await submitBlockAndWait({ waitForResponse: async () => response }, async () => {
+    submitted = true;
+  }), response);
+  assert.equal(submitted, true);
 });
 
 test('idempotency key is stable and changes with booking revision', () => {
