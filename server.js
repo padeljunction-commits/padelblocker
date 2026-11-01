@@ -5,9 +5,10 @@ const fs = require('fs/promises');
 const path = require('path');
 const express = require('express');
 const { chromium } = require('playwright-core');
+const { createBookingSync } = require('./booking-sync');
 
 const app = express();
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '2mb' }));
 
 const CONFIG = {
   PORT: Number(process.env.PORT || 3000),
@@ -33,6 +34,13 @@ let persistentContextPromise = null;
 let store = { version: 1, jobs: {}, health: {} };
 let storeWrite = Promise.resolve();
 let workerStarted = false;
+let tokenRefreshPromise = null;
+const SYNC_CALENDARS = String(process.env.BOOKING_CALENDAR_IDS || '').split(',').map(value => value.trim()).filter(Boolean);
+const bookingSync = createBookingSync({
+  getStore: () => store, persist: saveStore, calendars: SYNC_CALENDARS,
+  createBlock: createBlockReliable, readBlock: getBlockReliable, removeBlock: deleteBlockReliable,
+  maxAttempts: CONFIG.MAX_ATTEMPTS,
+});
 
 function requireSecret(req, res, next) {
   const supplied = req.get('x-webhook-secret') || req.body?.secret;
@@ -87,7 +95,7 @@ async function loadStore() {
 }
 
 function saveStore() {
-  storeWrite = storeWrite.then(async () => {
+  storeWrite = storeWrite.catch(() => {}).then(async () => {
     const temp = `${CONFIG.JOB_STORE_PATH}.tmp`;
     await fs.writeFile(temp, JSON.stringify(store, null, 2), 'utf8');
     await fs.rename(temp, CONFIG.JOB_STORE_PATH);
@@ -138,6 +146,7 @@ function publicJob(job) {
     blockId: job.blockId,
     deletedAt: job.deletedAt || null,
     booking: job.booking,
+    syncOwner: job.syncOwner || null,
   };
 }
 
@@ -170,11 +179,15 @@ function calendarWatcherHealth(now = Date.now(), health = store.health) {
 
 app.get('/', (req, res) => {
   const jobs = Object.values(store.jobs);
+  const sync = bookingSync.summary();
   res.json({
     status: 'ok',
     service: 'Padel Junction Playtomic Blocker',
     durableQueue: true,
     hasWriteToken: hasUsableWriteToken(),
+    revisionSync: { protocolVersion: 1, configured: SYNC_CALENDARS.length === 2,
+      snapshotAt: sync.snapshotAt, snapshotStale: sync.snapshotStale, paused: sync.paused,
+      counts: sync.counts, issues: sync.issues.length, historical: sync.historical.length },
     calendarWatcher: calendarWatcherHealth(),
     jobs: {
       queued: jobs.filter(j => j.status === 'queued').length,
@@ -184,6 +197,40 @@ app.get('/', (req, res) => {
       failed: jobs.filter(j => j.status === 'failed').length,
     },
   });
+});
+
+app.post('/sync/calendar', requireSecret, async (req, res) => {
+  if (SYNC_CALENDARS.length !== 2) return res.status(503).json({ error: 'BOOKING_CALENDAR_IDS must configure both court calendars' });
+  try {
+    const result = await bookingSync.acceptSnapshot(req.body);
+    res.status(202).json(result);
+  } catch (error) {
+    const invalid = /^(Incomplete or invalid|Invalid calendar event|Event outside)/.test(error.message);
+    res.status(invalid ? 400 : 503).json({ error: String(error.message).slice(0, 500) });
+  }
+});
+
+app.get('/admin/sync', requireSecret, (req, res) => res.json(bookingSync.summary()));
+
+app.post('/admin/sync/control', requireSecret, async (req, res) => {
+  try { res.json(await bookingSync.setPaused(req.body.paused)); }
+  catch (error) { res.status(400).json({ error: error.message }); }
+});
+
+app.post('/sync/calendar/preview', requireSecret, async (req, res) => {
+  if (SYNC_CALENDARS.length !== 2) return res.status(503).json({ error: 'BOOKING_CALENDAR_IDS must configure both court calendars' });
+  try { res.json(await bookingSync.previewSnapshot(req.body)); }
+  catch (error) { res.status(400).json({ error: error.message }); }
+});
+
+app.post('/admin/sync/:key/recover', requireSecret, async (req, res) => {
+  try { res.json(await bookingSync.recoverCreate(req.params.key, req.body.blockId)); }
+  catch (error) { res.status(409).json({ error: error.message }); }
+});
+
+app.post('/admin/sync/:key/retire', requireSecret, async (req, res) => {
+  try { res.json(await bookingSync.retireSource(req.params.key)); }
+  catch (error) { res.status(409).json({ error: error.message }); }
 });
 
 app.post('/heartbeat', requireSecret, async (req, res) => {
@@ -302,7 +349,7 @@ app.post('/admin/blocks/:id/delete', requireSecret, async (req, res) => {
 
 app.get('/admin/blocks/:id', requireSecret, async (req, res) => {
   try {
-    const result = await getBlockViaAPI(req.params.id);
+    const result = await getBlockReliable(req.params.id);
     res.json({ status: 'present', blockId: req.params.id, result });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -312,7 +359,7 @@ app.get('/admin/blocks/:id', requireSecret, async (req, res) => {
 function nextRunnableJob() {
   const now = Date.now();
   return Object.values(store.jobs)
-    .filter(j => j.status === 'queued' && new Date(j.nextAttemptAt).getTime() <= now)
+    .filter(j => j.status === 'queued' && !j.syncOwner && new Date(j.nextAttemptAt).getTime() <= now)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0] || null;
 }
 
@@ -321,6 +368,7 @@ async function runWorker() {
   workerStarted = true;
   console.log(`WORKER started store=${CONFIG.JOB_STORE_PATH}`);
   while (true) {
+    if (await bookingSync.processNext()) continue;
     const job = nextRunnableJob();
     if (!job) {
       await delay(1000);
@@ -356,23 +404,36 @@ async function processJob(job) {
   await saveStore();
 }
 
-async function createBlockReliable(booking) {
+async function createBlockReliable(booking, onCreated) {
+  if (!hasUsableWriteToken()) {
+    try { await refreshPlaytomicToken(); }
+    catch (error) { console.warn(`AUTH refresh unavailable; using create form: ${error.message}`); }
+  }
   if (hasUsableWriteToken()) {
+    let apiAccepted = false;
     try {
-      return await createAndVerifyBlock(booking, blockViaAPI);
+      return await createAndVerifyBlock(booking, async payload => {
+        const result = await blockViaAPI(payload);
+        apiAccepted = true;
+        return result;
+      }, onCreated);
     } catch (err) {
-      if (!isAuthFailure(err)) throw err;
+      // Never start another create after a successful POST, even if readback or
+      // checkpoint persistence failed with an authentication-shaped error.
+      if (apiAccepted || !isAuthFailure(err)) throw err;
       console.warn('AUTH cached write token rejected; falling back to Playtomic UI');
       clearWriteToken();
     }
   }
-  return createAndVerifyBlock(booking, blockViaBrowser);
+  return createAndVerifyBlock(booking, blockViaBrowser, onCreated);
 }
 
-async function createAndVerifyBlock(booking, createFn) {
+async function createAndVerifyBlock(booking, createFn, onCreated) {
   const result = await createFn(booking);
   const blockId = extractBlockId(result);
   if (!blockId) throw new Error('Post-write verification failed: Playtomic returned no block id');
+  // Persist the known ID before verification/cleanup so a restart cannot create a duplicate.
+  if (onCreated) await onCreated(result);
 
   try {
     const persisted = await getBlockViaAPI(blockId);
@@ -443,8 +504,70 @@ async function blockViaAPI(booking) {
     body: JSON.stringify(payload),
   });
   const body = await readResponse(res);
-  if (!res.ok) throw new Error(`API ${res.status}: ${stringifyBody(body)}`);
+  if (!res.ok) {
+    const error = new Error(`API ${res.status}: ${stringifyBody(body)}`);
+    error.safeToRetry = res.status >= 400 && res.status < 500;
+    throw error;
+  }
   return body;
+}
+
+async function authenticatedBlockOperation(operation) {
+  if (!hasUsableWriteToken()) await refreshPlaytomicToken();
+  try { return await operation(); }
+  catch (error) {
+    if (!isAuthFailure(error)) throw error;
+    clearWriteToken();
+    await refreshPlaytomicToken();
+    return operation();
+  }
+}
+
+function getBlockReliable(blockId) {
+  return authenticatedBlockOperation(() => getBlockViaAPI(blockId));
+}
+
+function deleteBlockReliable(blockId) {
+  return authenticatedBlockOperation(() => deleteBlockViaAPI(blockId));
+}
+
+function refreshPlaytomicToken() {
+  if (tokenRefreshPromise) return tokenRefreshPromise;
+  tokenRefreshPromise = (async () => {
+    const context = await getPersistentContext();
+    const page = await context.newPage();
+    page.on('request', request => {
+      try {
+        const url = new URL(request.url());
+        if (url.hostname === 'manager.playtomic.io' || url.hostname.endsWith('.playtomic.io')) {
+          const authorization = request.headers().authorization;
+          if (authorization?.startsWith('Bearer ') && tokenExpiry(authorization.slice(7)) > Date.now() + 60_000) {
+            cacheWriteToken(authorization);
+          }
+        }
+      } catch (_) { /* Ignore non-HTTP requests and incomplete headers. */ }
+    });
+    try {
+      const formUrl = `https://manager.playtomic.io/dashboard/schedule/add/block?tid=${CONFIG.PLAYTOMIC_TENANT_ID}`;
+      await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      const state = await Promise.race([
+        page.locator('#input-resource').waitFor({ state: 'visible', timeout: 25_000 }).then(() => 'form'),
+        page.getByRole('textbox', { name: 'Email' }).waitFor({ state: 'visible', timeout: 25_000 }).then(() => 'login'),
+      ]);
+      if (state === 'login') {
+        await page.getByRole('textbox', { name: 'Email' }).fill(CONFIG.PLAYTOMIC_EMAIL);
+        await page.getByRole('textbox', { name: 'Password' }).fill(CONFIG.PLAYTOMIC_PASSWORD);
+        await page.getByRole('button', { name: 'Log In' }).click();
+        await page.waitForFunction(() => !window.location.pathname.includes('/auth/login'), { timeout: 45_000 });
+        await page.waitForTimeout(3000);
+        await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+        await page.locator('#input-resource').waitFor({ state: 'visible', timeout: 25_000 });
+      }
+      if (!hasUsableWriteToken()) throw new Error('Authenticated page supplied no usable Playtomic token');
+      return true;
+    } finally { await page.close().catch(() => {}); }
+  })().finally(() => { tokenRefreshPromise = null; });
+  return tokenRefreshPromise;
 }
 
 async function getBlockViaAPI(blockId) {
@@ -506,10 +629,12 @@ function extractBlockId(result) {
 }
 
 async function blockViaBrowser(booking) {
-  const context = await getPersistentContext();
-  const page = await context.newPage();
+  let page;
+  let submissionStarted = false;
 
   try {
+    const context = await getPersistentContext();
+    page = await context.newPage();
     const start = new Date(booking.startTime);
     const end = new Date(booking.endTime);
     const courtNum = booking.court.match(/\d+/)?.[0];
@@ -544,7 +669,9 @@ async function blockViaBrowser(booking) {
     await selectDropdown(page, 'input-startTime', toTypeStr(start), toDisplayTime(start));
     await selectDropdown(page, 'input-endTime', toTypeStr(end), toDisplayTime(end));
 
-    const response = await submitBlockAndWait(page, () => page.evaluate(() => {
+    const response = await submitBlockAndWait(page, () => {
+      submissionStarted = true;
+      return page.evaluate(() => {
       const resourceInput = document.getElementById('input-resource');
       if (!resourceInput) throw new Error('#input-resource missing at submit');
       let container = resourceInput.parentElement;
@@ -558,18 +685,24 @@ async function blockViaBrowser(booking) {
         }
       }
       throw new Error('Form-scoped enabled Create button not found');
-    }));
+      });
+    });
     const responseBody = await readPlaywrightResponse(response);
-    if (!response.ok()) throw new Error(`UI create API ${response.status()}: ${stringifyBody(responseBody)}`);
+    if (!response.ok()) {
+      const error = new Error(`UI create API ${response.status()}: ${stringifyBody(responseBody)}`);
+      error.safeToRetry = response.status() >= 400 && response.status() < 500;
+      throw error;
+    }
 
     cacheWriteToken(response.request().headers().authorization);
     console.log(`UI create succeeded status=${response.status()} block=${extractBlockId(responseBody) || 'unknown'}`);
     return responseBody;
   } catch (err) {
-    console.error(`UI failure url=${page.url()} error=${err.message}`);
+    if (!submissionStarted || /Form-scoped enabled Create button not found/.test(err.message)) err.safeToRetry = true;
+    console.error(`UI failure url=${page?.url() || 'not opened'} error=${err.message}`);
     throw err;
   } finally {
-    await page.close();
+    if (page) await page.close().catch(() => {});
   }
 }
 
@@ -596,6 +729,9 @@ async function getPersistentContext() {
       timezoneId: CLUB_TZ,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
       ...(CONFIG.CHROMIUM_PATH ? { executablePath: CONFIG.CHROMIUM_PATH } : {}),
+    }).then(context => {
+      context.on('close', () => { persistentContextPromise = null; });
+      return context;
     }).catch(err => {
       persistentContextPromise = null;
       throw err;
@@ -768,7 +904,7 @@ async function start() {
   app.listen(CONFIG.PORT, () => console.log(`SERVICE listening port=${CONFIG.PORT}`));
   runWorker().catch(err => {
     console.error(`WORKER fatal: ${err.stack || err.message}`);
-    process.exitCode = 1;
+    process.exit(1);
   });
 }
 
