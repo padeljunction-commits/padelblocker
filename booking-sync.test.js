@@ -65,6 +65,21 @@ test('same calendar ID rescheduled: verify new block before deleting old block',
   assert.equal(h.sync.summary().issues.length, 0);
 });
 
+test('a continuing conflict survives the next calendar scan so its alert can be delivered', async () => {
+  const h = harness();
+  const reservation = { ...moved, eventId: 'paid@google.com', customer: '(Playtomic) Paid booking' };
+  await h.snapshot([first]); await h.drain();
+  await h.snapshot([moved], [reservation]); await h.drain();
+  assert.equal(h.sync.summary().issues[0].code, 'reservation_conflict');
+  // Apps Script reads issues immediately after delivering each complete snapshot.
+  await h.snapshot([moved], [reservation]);
+  assert.equal(h.sync.summary().issues[0]?.code, 'reservation_conflict');
+  assert.equal(h.sync.summary().entries[0].status, 'conflict');
+  await h.snapshot([moved], []); await h.drain();
+  assert.equal(h.sync.summary().issues.length, 0);
+  assert.equal(h.blocks.size, 1);
+});
+
 test('unchanged snapshots are idempotent; stale snapshots cannot undo a move', async () => {
   const h = harness();
   await h.snapshot([moved]); await h.drain();

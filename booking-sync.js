@@ -138,7 +138,10 @@ function createBookingSync(deps) {
         }
         entry.desired = copy(desired);
         migrate(entry);
-        if (changed || ['conflict', 'source_conflict', 'missing', 'historical'].includes(entry.status)) {
+        const conflictCleared = entry.status === 'conflict' && !reservations.some(reservation => overlaps(desired, reservation));
+        // Keep a continuing conflict visible to the alert check that immediately
+        // follows snapshot delivery; do not clear and rediscover it on every scan.
+        if (changed || conflictCleared || ['source_conflict', 'missing', 'historical'].includes(entry.status)) {
           entry.status = 'pending'; entry.attempts = 0; entry.nextAttemptAt = stamp();
           entry.pendingSince = stamp(); entry.error = null; entry.errorCode = null;
         }
