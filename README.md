@@ -1,5 +1,44 @@
 # Padel Junction Playtomic blocker
 
+## Recurring occurrence support (staged, requires verified activation)
+
+CalendarApp's `getId()` exposes the shared iCal UID, not an individual recurring
+session ID. Recurring sessions must be enriched from Google Calendar API v3 with
+the provider instance ID, series ID, and `originalStartTime`. The worker keys an
+occurrence by full iCal UID plus its original start, never by its current start;
+moving one session therefore replaces only that session's owned block.
+
+This lookup is off unless Script Property `PLAYTOMIC_OCCURRENCE_SYNC_ENABLED`
+is exactly `true`. Before enabling it:
+
+1. Preserve/read the latest live shared Apps Script, its settings and triggers.
+2. Deploy the exact tested worker and check `revisionSync.occurrenceIdentityVersion=1`.
+3. Surgically replace only the marked revision module in live Code.gs; preserve
+   the door and inbound code, existing URLs, secrets, triggers and revision flag.
+4. Verify Calendar API v3 is enabled for the Apps Script project's existing Google
+   Cloud project and the existing Padel calendar authorization can read it. Never
+   print or persist the Apps Script OAuth token.
+5. Run `previewBookingOccurrenceSync()` while the occurrence flag is still off.
+   This reads all API pages and computes an isolated, read-only worker preview.
+   A failed or ambiguous lookup must not be published as a complete snapshot.
+6. Inspect all proposed future writes and legacy ownership transfers. Pause the
+   worker during the actual authoritative migration import if needed. Only then
+   enable the property and verify complete snapshots and persisted destinations.
+7. Test a disposable September 2027 recurring series, moving one occurrence and
+   changing its court while confirming its sibling is unchanged. Verify each
+   persisted court/start/end, remove test sources, explicitly retire their owned
+   entries, and verify every disposable block is absent. Do not call this complete
+   from local tests alone.
+
+Legacy series holds without blocks are superseded once authoritative occurrence
+identities arrive. Existing owned blocks are transferred only to one unambiguous
+occurrence; uncertain writes or unmatched ownership remain held for review.
+Legacy shared aliases cannot cause one instance to adopt another instance's job.
+
+Issue emails are sent when the issue signature changes and on full recovery;
+unchanged issue lists are no longer resent every six hours. New scan outages and
+the independent legacy delivery monitor retain their existing alert safeguards.
+
 Receives CatchCorner booking events from Google Apps Script and creates matching
 Playtomic availability blocks. This service does not participate in the
 Playtomic-to-Google-Calendar sync.

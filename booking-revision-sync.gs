@@ -43,18 +43,23 @@ function watchCalendarForNonPlaytomic() {
   if (heartbeat) sendBookingWatcherHeartbeat_(heartbeat);
 }
 
-function collectBookingCalendarSnapshot_() {
+function collectBookingCalendarSnapshot_(forceOccurrences) {
   const now = new Date();
   const windowStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
   const windowEnd = new Date(now.getTime() + WEBHOOK_HORIZON_DAYS * 24 * 60 * 60 * 1000);
   const calendars = [COURT1_CAL_ID, COURT2_CAL_ID];
   const events = [];
   const reservations = [];
+  const occurrenceEnabled = forceOccurrences === true ||
+    PropertiesService.getScriptProperties().getProperty('PLAYTOMIC_OCCURRENCE_SYNC_ENABLED') === 'true';
   calendars.forEach((calendarId, index) => {
     const calendar = CalendarApp.getCalendarById(calendarId);
     if (!calendar) throw new Error('Cannot access Court ' + (index + 1) + ' calendar; incomplete snapshot was not sent');
     const sourceEvents = calendar.getEvents(windowStart, windowEnd);
     if (!Array.isArray(sourceEvents)) throw new Error('Court calendar returned an invalid event list');
+    const hasRecurring = occurrenceEnabled && sourceEvents.some(event => typeof event.isRecurringEvent === 'function' && event.isRecurringEvent());
+    const occurrences = hasRecurring ? bookingCalendarOccurrenceIndex_(calendarId, windowStart, windowEnd,
+      typeof calendar.getTimeZone === 'function' ? calendar.getTimeZone() : 'America/Toronto') : {};
     sourceEvents.forEach(event => {
       const title = event.getTitle() || '';
       const record = {
@@ -62,6 +67,14 @@ function collectBookingCalendarSnapshot_() {
         customer: title.slice(0, 180), startTime: event.getStartTime().toISOString(),
         endTime: event.getEndTime().toISOString(),
       };
+      if (occurrenceEnabled && typeof event.isRecurringEvent === 'function' && event.isRecurringEvent()) {
+        const key = JSON.stringify([record.eventId, record.startTime, record.endTime]);
+        const matches = occurrences[key] || [];
+        if (matches.length !== 1) throw new Error('Cannot uniquely identify recurring calendar occurrence; incomplete snapshot was not sent');
+        record.occurrenceId = matches[0].id;
+        record.recurringEventId = matches[0].recurringEventId;
+        record.originalStartTime = bookingCalendarApiDate_(matches[0].originalStartTime, 'UTC');
+      }
       if (typeof event.getLastUpdated === 'function') record.sourceUpdatedAt = event.getLastUpdated().toISOString();
       if (title.includes(PLAYTOMIC_TAG)) reservations.push(record);
       else events.push(record);
@@ -72,6 +85,50 @@ function collectBookingCalendarSnapshot_() {
     calendars: calendars, events: events, reservations: reservations };
 }
 
+function bookingCalendarApiDate_(value, timeZone) {
+  if (value && value.dateTime && isFinite(new Date(value.dateTime).getTime())) return new Date(value.dateTime).toISOString();
+  if (value && /^\d{4}-\d{2}-\d{2}$/.test(value.date || '')) {
+    return Utilities.parseDate(value.date, timeZone, 'yyyy-MM-dd').toISOString();
+  }
+  throw new Error('Calendar API returned an invalid occurrence date');
+}
+
+function bookingCalendarOccurrenceIndex_(calendarId, windowStart, windowEnd, timeZone) {
+  const index = {};
+  const seenPages = {};
+  let pageToken = '';
+  let count = 0;
+  do {
+    if (seenPages[pageToken]) throw new Error('Calendar occurrence pagination repeated; incomplete snapshot was not sent');
+    seenPages[pageToken] = true;
+    const params = { singleEvents: 'true', showDeleted: 'false', maxResults: '2500',
+      timeMin: windowStart.toISOString(), timeMax: windowEnd.toISOString(),
+      fields: 'nextPageToken,items(id,iCalUID,recurringEventId,originalStartTime,start,end,status)' };
+    if (pageToken) params.pageToken = pageToken;
+    const query = Object.keys(params).map(key => encodeURIComponent(key) + '=' + encodeURIComponent(params[key])).join('&');
+    const response = UrlFetchApp.fetch('https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(calendarId) + '/events?' + query, {
+      method: 'GET', headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() }, muteHttpExceptions: true,
+    });
+    const status = response.getResponseCode();
+    if (status !== 200) throw new Error('Calendar occurrence lookup failed: HTTP ' + status + '; verify Calendar API is enabled for this Apps Script project');
+    const body = JSON.parse(response.getContentText());
+    if (!Array.isArray(body.items)) throw new Error('Calendar occurrence lookup returned an incomplete page');
+    count += body.items.length;
+    if (count > 5000) throw new Error('Calendar occurrence scan exceeded the safety limit');
+    body.items.forEach(item => {
+      if (!item.recurringEventId || item.status === 'cancelled') return;
+      if (!item.id || !item.iCalUID || !item.originalStartTime) throw new Error('Calendar occurrence identity missing');
+      const start = bookingCalendarApiDate_(item.start, timeZone);
+      const end = bookingCalendarApiDate_(item.end, timeZone);
+      const key = JSON.stringify([item.iCalUID, start, end]);
+      if (!index[key]) index[key] = [];
+      index[key].push(item);
+    });
+    pageToken = body.nextPageToken || '';
+  } while (pageToken);
+  return index;
+}
+
 function bookingSyncEndpoint_(path) {
   const base = RAILWAY_WEBHOOK_URL.replace(/\/webhook\/catchcorner\/?$/, '');
   if (base === RAILWAY_WEBHOOK_URL) throw new Error('Invalid Railway webhook URL');
@@ -80,13 +137,23 @@ function bookingSyncEndpoint_(path) {
 
 // Read-only migration preview: no source properties or Playtomic blocks change.
 function previewBookingRevisionSync() {
+  return bookingSnapshotPreview_(false);
+}
+
+// Exercise Calendar API permissions and identity resolution without enabling writes.
+function previewBookingOccurrenceSync() {
+  return bookingSnapshotPreview_(true);
+}
+
+function bookingSnapshotPreview_(forceOccurrences) {
   const response = UrlFetchApp.fetch(bookingSyncEndpoint_('/sync/calendar/preview'), {
     method: 'POST', contentType: 'application/json', headers: { 'x-webhook-secret': WEBHOOK_SECRET },
-    payload: JSON.stringify(collectBookingCalendarSnapshot_()), muteHttpExceptions: true,
+    payload: JSON.stringify(collectBookingCalendarSnapshot_(forceOccurrences)), muteHttpExceptions: true,
   });
   if (response.getResponseCode() !== 200) throw new Error('Preview failed: HTTP ' + response.getResponseCode());
   const report = JSON.parse(response.getContentText());
   if (report.dryRun !== true) throw new Error('Worker did not confirm read-only preview');
+  if (forceOccurrences && report.occurrenceIdentityVersion !== 1) throw new Error('Worker occurrence support must be deployed before activation');
   Logger.log(JSON.stringify({ dryRun: true, plannedCounts: report.plannedCounts,
     changes: report.changes.filter(item => item.action !== 'verify_existing').slice(0, 50) }));
   return report;
@@ -138,8 +205,8 @@ function checkCalendarSyncAlerts_() {
     issue.booking && issue.booking.endTime].join('|')).sort().join('\n');
   const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, signature, Utilities.Charset.UTF_8)
     .map(value => ('0' + ((value + 256) % 256).toString(16)).slice(-2)).join('');
-  const lastAt = props.getProperty('BOOKING_SYNC_ISSUE_ALERT_AT');
-  if (props.getProperty('BOOKING_SYNC_ISSUE_DIGEST') !== digest || !lastAt || Date.now() - new Date(lastAt).getTime() >= 6 * 60 * 60 * 1000) {
+  // Notify on meaningful issue changes, not on a timer for the same warning.
+  if (props.getProperty('BOOKING_SYNC_ISSUE_DIGEST') !== digest) {
     const details = report.issues.slice(0, 20).map(issue => {
       const booking = issue.booking || {};
       return [issue.key + ' — ' + issue.status, booking.customer || '',

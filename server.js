@@ -186,6 +186,7 @@ app.get('/', (req, res) => {
     durableQueue: true,
     hasWriteToken: hasUsableWriteToken(),
     revisionSync: { protocolVersion: 1, configured: SYNC_CALENDARS.length === 2,
+      occurrenceIdentityVersion: sync.occurrenceIdentityVersion,
       snapshotAt: sync.snapshotAt, snapshotStale: sync.snapshotStale, paused: sync.paused,
       counts: sync.counts, issues: sync.issues.length, historical: sync.historical.length },
     calendarWatcher: calendarWatcherHealth(),

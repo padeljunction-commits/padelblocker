@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test server.test.js booking-sync.test.js sync-http.test.js"
+    "test": "node --test server.test.js booking-sync.test.js booking-revision-sync.test.js sync-http.test.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

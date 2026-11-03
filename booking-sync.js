@@ -28,8 +28,15 @@ function normalizeEvent(event, calendarIds) {
       Date.parse(event.endTime) <= Date.parse(event.startTime)) throw new Error('Invalid calendar event');
   const customer = String(event.customer || 'External booking').slice(0, 180);
   const bookingNumber = ccId(customer);
+  const recurring = [event.occurrenceId, event.recurringEventId, event.originalStartTime].some(value => value !== undefined);
+  if (recurring && (typeof event.occurrenceId !== 'string' || !event.occurrenceId || event.occurrenceId.length > 300 ||
+      typeof event.recurringEventId !== 'string' || !event.recurringEventId || event.recurringEventId.length > 300 ||
+      !Number.isFinite(Date.parse(event.originalStartTime)))) throw new Error('Invalid calendar event occurrence identity');
   return {
-    id: bookingNumber ? `CC-${bookingNumber}` : `event:${event.eventId}`,
+    id: recurring ? `event:${event.eventId}:occurrence:${iso(event.originalStartTime)}` :
+      bookingNumber ? `CC-${bookingNumber}` : `event:${event.eventId}`,
+    ...(recurring ? { occurrenceId: event.occurrenceId, recurringEventId: event.recurringEventId,
+      originalStartTime: iso(event.originalStartTime) } : {}),
     eventId: event.eventId, calendarId: event.calendarId,
     legacyId: event.eventId.replace('@google.com', '').slice(0, 20),
     customer, court: event.court, startTime: iso(event.startTime), endTime: iso(event.endTime),
@@ -56,6 +63,10 @@ function createBookingSync(deps) {
       const belongs = entry.key.startsWith('CC-') ? entry.key === `CC-${jobNumber}` :
         entry.aliases.includes(job.sourceId);
       if (!belongs || (job.syncOwner && job.syncOwner !== entry.key)) continue;
+      // A legacy series alias is shared by every occurrence. Only the matching
+      // original occurrence (or exact persisted interval) may adopt its job.
+      if (entry.desired.originalStartTime && fingerprint(job.booking) !== fingerprint(entry.desired) &&
+          Date.parse(job.booking.startTime) !== Date.parse(entry.desired.originalStartTime)) continue;
       job.syncOwner = entry.key;
       if (!job.blockId && Number(job.attempts || 0) > 0 && ['queued', 'failed', 'superseded'].includes(job.status)) {
         entry.createIntent ||= { revision: fingerprint(job.booking), booking: copy(job.booking),
@@ -70,6 +81,41 @@ function createBookingSync(deps) {
       entry.blocks.push({ id: job.blockId, booking: copy(job.booking),
         expectedName: job.result?.name || `CatchCorner - ${job.booking.customer || 'Booking'}`,
         legacyJobId: job.id, origin: 'legacy', verifiedAt: null, removedAt: null });
+    }
+  }
+
+  function migrateOccurrenceFamilies(current, events) {
+    const families = new Map();
+    for (const event of events.filter(item => item.originalStartTime)) {
+      if (!families.has(event.eventId)) families.set(event.eventId, new Set());
+      families.get(event.eventId).add(event.id);
+    }
+    for (const [uid, children] of families) {
+      const parent = current.entries[`event:${uid}`];
+      if (!parent || parent.retiredAt || parent.status === 'superseded') continue;
+      const active = parent.blocks.filter(block => !block.removedAt);
+      const assignments = active.map(block => {
+        const candidates = [...children].map(key => current.entries[key]).filter(child =>
+          fingerprint(child.desired) === fingerprint(block.booking) ||
+          Date.parse(child.desired.originalStartTime) === Date.parse(block.booking.startTime));
+        return { block, child: candidates.length === 1 ? candidates[0] : null };
+      });
+      if (parent.createIntent || assignments.some(item => !item.child)) {
+        for (const key of children) {
+          const child = current.entries[key];
+          child.status = 'source_conflict'; child.errorCode = 'recurrence_migration_review';
+          child.error = 'Existing series ownership is uncertain; retained blocks require verified migration';
+        }
+        continue;
+      }
+      for (const { block, child } of assignments) {
+        if (!child.blocks.some(item => item.id === block.id)) child.blocks.push(block);
+        const job = deps.getStore().jobs?.[block.legacyJobId];
+        if (job?.syncOwner === parent.key) job.syncOwner = child.key;
+      }
+      parent.occurrenceMigration = { migratedAt: stamp(), children: [...children], blocks: copy(parent.blocks) };
+      parent.blocks = [];
+      parent.status = 'superseded'; parent.error = null; parent.errorCode = null; parent.pendingSince = null;
     }
   }
 
@@ -108,7 +154,7 @@ function createBookingSync(deps) {
     const legacyAliases = new Map();
     for (const event of events) {
       if (!legacyAliases.has(event.legacyId)) legacyAliases.set(event.legacyId, new Set());
-      legacyAliases.get(event.legacyId).add(event.id);
+      legacyAliases.get(event.legacyId).add(event.eventId);
     }
     accepting = true;
     try {
@@ -151,8 +197,9 @@ function createBookingSync(deps) {
           entry.error = drift ? 'Past booking changed after its original block; audit only, no past write attempted' : null;
         }
       }
+      migrateOccurrenceFamilies(current, events);
       for (const entry of Object.values(current.entries)) {
-        if (entry.retiredAt) continue;
+        if (entry.retiredAt || entry.status === 'superseded') continue;
         if (grouped.has(entry.key) || Date.parse(entry.desired.endTime) <= now()) continue;
         if (Date.parse(entry.desired.startTime) >= Date.parse(snapshot.windowEnd) ||
             Date.parse(entry.desired.endTime) <= Date.parse(snapshot.windowStart)) continue;
@@ -323,7 +370,7 @@ function createBookingSync(deps) {
           Date.parse(entry.desired.endTime) > now()) issues.push({ key: entry.key, code: 'sync_overdue',
         status: entry.status, message: 'Current calendar revision has not completed within ten minutes', booking: entry.desired });
     }
-    return { schemaVersion: 1, snapshotAt: current.snapshotAt, persistenceFault, paused: Boolean(current.paused),
+    return { schemaVersion: 1, occurrenceIdentityVersion: 1, snapshotAt: current.snapshotAt, persistenceFault, paused: Boolean(current.paused),
       snapshotStale: Boolean(current.snapshotAt && now() - Date.parse(current.snapshotAt) > 20 * MINUTE),
       counts: Object.fromEntries([...new Set(entries.map(entry => entry.status))]
         .map(status => [status, entries.filter(entry => entry.status === status).length])),
@@ -393,7 +440,7 @@ function createBookingSync(deps) {
         conflict ? 'reservation_conflict' : targetExists ? 'verify_existing' : existing.length ? 'replace' : 'create';
       return { key: entry.key, action, booking: entry.desired, knownBlockIds: existing.map(block => block.id) };
     });
-    return { schemaVersion: 1, dryRun: true, snapshotAt: report.snapshotAt,
+    return { schemaVersion: 1, occurrenceIdentityVersion: 1, dryRun: true, snapshotAt: report.snapshotAt,
       plannedCounts: Object.fromEntries([...new Set(changes.map(item => item.action))]
         .map(action => [action, changes.filter(item => item.action === action).length])), changes };
   }

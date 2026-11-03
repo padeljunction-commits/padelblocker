@@ -80,6 +80,22 @@ test('a continuing conflict survives the next calendar scan so its alert can be 
   assert.equal(h.blocks.size, 1);
 });
 
+test('recurring occurrences with one iCal UID sync independently and a moved instance keeps its identity', async () => {
+  const h = harness();
+  const one = { ...first, customer: 'Recurring lesson', eventId: 'series@google.com',
+    occurrenceId: 'series_20270915T000000Z', recurringEventId: 'series', originalStartTime: first.startTime };
+  const two = { ...one, startTime: '2027-09-22T00:00:00Z', endTime: '2027-09-22T01:00:00Z',
+    occurrenceId: 'series_20270922T000000Z', originalStartTime: '2027-09-22T00:00:00Z' };
+  await h.snapshot([one, two]); await h.drain();
+  assert.equal(h.sync.summary().issues.length, 0, 'different recurrence dates are not conflicting revisions');
+  assert.equal(h.blocks.size, 2);
+  const keys = h.sync.summary().entries.map(entry => entry.key).sort();
+  await h.snapshot([{ ...one, ...{ startTime: moved.startTime, endTime: moved.endTime } }, two]); await h.drain();
+  assert.deepEqual(h.sync.summary().entries.map(entry => entry.key).sort(), keys);
+  assert.equal(h.blocks.size, 2, 'only the moved occurrence is replaced');
+  assert.ok([...h.blocks.values()].some(block => block.start === two.startTime.slice(0, 19)));
+});
+
 test('unchanged snapshots are idempotent; stale snapshots cannot undo a move', async () => {
   const h = harness();
   await h.snapshot([moved]); await h.drain();
@@ -91,6 +107,88 @@ test('unchanged snapshots are idempotent; stale snapshots cannot undo a move', a
   await h.drain();
   assert.equal(h.actions.filter(action => action[0] === 'create').length, 1);
   assert.equal([...h.blocks.values()][0].start, moved.startTime.slice(0,19));
+});
+
+test('the former ambiguous series hold is superseded only after occurrence identities arrive', async () => {
+  const h = harness();
+  const one = { ...first, eventId: 'series@google.com', customer: 'Recurring lesson' };
+  const two = { ...one, startTime: moved.startTime, endTime: moved.endTime };
+  await h.snapshot([one, two]); await h.drain();
+  assert.equal(h.sync.summary().issues[0].code, 'source_conflict');
+  await h.snapshot([one, two].map((event, index) => ({ ...event, occurrenceId: 'instance-' + index,
+    recurringEventId: 'series', originalStartTime: event.startTime }))); await h.drain();
+  assert.equal(h.sync.summary().issues.length, 0);
+  assert.equal(h.blocks.size, 2);
+  assert.equal(h.state.bookingSync.entries['event:series@google.com'].status, 'superseded');
+  await h.snapshot([one, two].map((event, index) => ({ ...event, occurrenceId: 'instance-' + index,
+    recurringEventId: 'series', originalStartTime: event.startTime }))); await h.drain();
+  assert.equal(h.sync.summary().issues.length, 0, 'the superseded series must not become a missing-source alert');
+});
+
+test('an existing verified series block is transferred to its occurrence without a duplicate create', async () => {
+  const h = harness();
+  const one = { ...first, eventId: 'series@google.com', customer: 'Recurring lesson' };
+  await h.snapshot([one]); await h.drain();
+  const originalId = [...h.blocks.keys()][0];
+  const two = { ...one, startTime: moved.startTime, endTime: moved.endTime };
+  await h.snapshot([one, two].map((event, index) => ({ ...event, occurrenceId: 'instance-' + index,
+    recurringEventId: 'series', originalStartTime: event.startTime }))); await h.drain();
+  assert.equal(h.blocks.size, 2);
+  assert.ok(h.blocks.has(originalId));
+  assert.equal(h.actions.filter(action => action[0] === 'create').length, 2);
+  assert.equal(h.sync.summary().issues.length, 0);
+});
+
+test('recurrence migration never discards an uncertain create intent', async () => {
+  const h = harness();
+  const one = { ...first, eventId: 'series@google.com', customer: 'Recurring lesson' };
+  h.faults.create = new Error('Connection lost after possible write');
+  await h.snapshot([one]); await h.drain();
+  delete h.faults.create;
+  await h.snapshot([{ ...one, occurrenceId: 'instance', recurringEventId: 'series', originalStartTime: one.startTime }]);
+  await h.drain();
+  assert.ok(h.state.bookingSync.entries['event:series@google.com'].createIntent);
+  assert.equal(h.actions.filter(action => action[0] === 'create').length, 1);
+  assert.ok(h.sync.summary().issues.some(issue => issue.code === 'recurrence_migration_review'));
+});
+
+test('incomplete occurrence metadata fails closed rather than inventing a time-based identity', async () => {
+  const h = harness();
+  await assert.rejects(h.snapshot([{ ...first, occurrenceId: 'instance-without-origin' }]), /occurrence identity/);
+  assert.equal(h.actions.length, 0);
+});
+
+test('legacy series jobs belong to exactly one occurrence, not every session sharing their alias', async () => {
+  const one = { ...first, customer: 'Recurring lesson', eventId: 'series@google.com',
+    occurrenceId: 'first-instance', recurringEventId: 'series', originalStartTime: first.startTime };
+  const two = { ...one, occurrenceId: 'second-instance', originalStartTime: moved.startTime,
+    startTime: moved.startTime, endTime: moved.endTime };
+  const h = harness({ version: 1, jobs: { legacy: { id: 'legacy', sourceId: 'series', status: 'succeeded',
+    attempts: 1, blockId: 'legacy-block', booking: { ...first, customer: 'Recurring lesson' },
+    result: { name: 'CatchCorner - Recurring lesson' } } } });
+  h.blocks.set('legacy-block', { id: 'legacy-block', name: 'CatchCorner - Recurring lesson',
+    resource_ids: ['1f900b5d-f99d-4b17-9a8a-1ceb28be5299'], start: first.startTime.slice(0, 19), end: first.endTime.slice(0, 19) });
+  await h.snapshot([one, two]); await h.drain();
+  assert.equal(h.blocks.size, 2);
+  assert.ok(h.blocks.has('legacy-block'));
+  assert.equal(h.actions.filter(action => action[0] === 'create').length, 1);
+  assert.equal(h.actions.filter(action => action[0] === 'delete').length, 0);
+});
+
+test('a recurring cross-court move retains its original identity and leaves the sibling block unchanged', async () => {
+  const h = harness();
+  const one = { ...first, customer: 'Recurring lesson', eventId: 'series@google.com',
+    occurrenceId: 'instance-one', recurringEventId: 'series', originalStartTime: first.startTime };
+  const two = { ...one, occurrenceId: 'instance-two', originalStartTime: moved.startTime,
+    startTime: moved.startTime, endTime: moved.endTime };
+  await h.snapshot([one, two]); await h.drain();
+  const sibling = [...h.blocks.values()].find(block => block.start === two.startTime.slice(0, 19));
+  await h.snapshot([{ ...one, court: 'Padel 2', calendarId: 'court2', occurrenceId: 'provider-moved-id',
+    startTime: '2027-09-15T00:30:00Z', endTime: '2027-09-15T01:30:00Z' }, two]); await h.drain();
+  assert.equal(h.blocks.size, 2);
+  assert.deepEqual(h.blocks.get(sibling.id), sibling);
+  assert.ok([...h.blocks.values()].some(block => block.resource_ids[0] === '6ea04658-e7db-456a-beef-efc9c91fa7b0'));
+  assert.equal(h.sync.summary().issues.length, 0);
 });
 
 test('a definite replacement rejection keeps the original and retries safely', async () => {
